@@ -7,11 +7,17 @@
     axx.py <パターンファイル.axx> <ソース.s> -o <出力.o>
 
 処理の流れ（入口は Assembler.run()）:
-  1. パターンファイル読み込み  PatternFileReader.readpat()（.INCLUDE 展開、"::" で分割）
+  1. パターンファイル読み込み  Assembler._load_pattern() → PatternFileReader.readpat()
+                               （.INCLUDE 展開、"::" で分割、索引と持ち上げの準備）
   2. マクロ展開                MacroPreprocessor.expand()（!def / !if / !while ...）
-  3. パス1                     長さが収束するまで最大 MAX_RELAX 回（リラクゼーション）
-  4. パス2                     確定した番地でバイト列とリロケーションを作る
-  5. 出力                      ELF / 生バイナリ / ラベル TSV
+  3. パス1                     Assembler._pass1(): 長さが収束するまで最大 16 回（リラクゼーション）
+  4. パス2                     Assembler._pass2(): 確定した番地でバイト列とリロケーションを作る
+  5. 出力                      Assembler._write_outputs(): ELF / 生バイナリ / ラベル TSV
+
+1 行の処理は lineassemble0() → lineassemble() → lineassemble2()（組み込みディレクティブは
+_ADIR_TABLE で、命令は _match_line() で候補のパターンを照合し _assemble_best() で
+binary_list を評価する）。-o のリロケーションは _line_relocations()、ELF の書き出しは
+write_elf_obj() の各段（_elf_sections() 〜 _elf_write()）。
 
 計算の 3 層: マクロ層（制限なし）、パターン層（PatternMatcher、停止性を保証）、
 ミニ言語（MiniInterp、`.call` のときだけ動く、上限付き）。
@@ -24,9 +30,11 @@ try:
     import readline
 except ImportError:
     pass
+import argparse
 import functools
 import itertools
 import struct
+from collections import defaultdict
 import sys
 import errno
 import os
@@ -34,6 +42,8 @@ import math
 import signal
 import re
 import tempfile
+import traceback
+from types import SimpleNamespace
 
 
 # パス1で「まだ値が無い」を 0 番地と区別する番兵。
@@ -472,7 +482,7 @@ def _pat_candidates(index, maxkey, lin):
         ent = index.get(key)
         if ent is not None:
             cand.extend(ent[0])
-            if lin[ci + 1:ci + 2] not in _PFX_WORD:
+            if lin[ci + 1:ci + 2] not in _WORD_CHARS:
                 cand.extend(ent[1])
         if len(key) >= maxkey:
             break
@@ -494,14 +504,52 @@ _AUPPER = str.maketrans(LOWER, CAPITAL)
 _ALOWER = str.maketrans(CAPITAL, LOWER)
 _AUP1 = dict(zip(LOWER, CAPITAL))
 _AALNUM = frozenset(ALPHABET + DIGIT)
-# _PFX_OPEN: 先頭大文字列の直後にあればニーモニックはまだ続く。_PFX_WORD: 語を作る文字。
+# _PFX_OPEN: 先頭大文字列の直後にあればニーモニックはまだ続く。
 _PFX_OPEN = frozenset(LOWER + DIGIT + '!\\[_')
-_PFX_WORD = frozenset(ALPHABET + DIGIT + '_')
+# 語を作る文字（ニーモニックの続き・ラベル・シンボル・サブ表の名前）。
+_WORD_CHARS = frozenset(ALPHABET + DIGIT + '_')
+
+
+def _ad(c):
+    """ASCII の数字か（str.isdigit() は全角数字なども数字とみなす）。"""
+    return '0' <= c <= '9'
+
+
+def _aa(c):
+    """ASCII の英字か。"""
+    return ('a' <= c <= 'z') or ('A' <= c <= 'Z')
+
+
+def _aan(c):
+    """ASCII の英数字か（caxx.c の isalnum() と同じ範囲）。"""
+    return _ad(c) or _aa(c)
+
+
+def _alow(s):
+    """ASCII だけを小文字にする（caxx.c の strcasecmp() と同じ範囲）。"""
+    return s.translate(_ALOWER)
+
+
+# マクロ層とミニ言語の文字列は UTF-8 のバイトの並び（長さ・添字・大文字化・比較・
+# 1 文字の文字定数はバイトで決める。caxx.c は C 文字列をそのまま持つ）。
+def _mb(s):
+    """文字列を UTF-8 のバイト列にする。"""
+    return s.encode('utf-8', 'surrogateescape')
+
+
+def _mt(b):
+    """バイト列を文字列に戻す（切れた UTF-8 は surrogateescape の文字になる）。"""
+    return b.decode('utf-8', 'surrogateescape')
+
+
+def _mnorm(s):
+    """連結などで割れた UTF-8 をつなぎ直す。"""
+    return _mt(_mb(s))
 
 
 def _is_sub_name(s):
     """`.sub::名前` / `!S{{名前}}` に書ける名前か。"""
-    return bool(s) and all(c in _PFX_WORD for c in s)
+    return bool(s) and all(c in _WORD_CHARS for c in s)
 
 
 def _dot_kw(s):
@@ -983,8 +1031,8 @@ def _elf_section_attrs(state, name):
     return flags, sh_type, align, entsize
 
 
-def _elf_default_align(sh_type, is_elf64):
-    """整列の既定値（SHT_NOTE だけ 4）。is_elf64 は caxx.c と呼び出し形をそろえるためだけ。"""
+def _elf_default_align(sh_type):
+    """整列の既定値（SHT_NOTE だけ 4）。"""
     return 4 if sh_type == 7 else 16
 
 
@@ -1110,6 +1158,11 @@ _SYM_ATTR_DEFAULT = (0, 0, 0, 0, 0, 0, 0)
 _SA_TYPE, _SA_SIZE_SET, _SA_SIZE, _SA_OTHER, _SA_WEAK, _SA_COMMON, _SA_ALIGN = range(7)
 
 
+def _lbl_rtype(le):
+    """ラベルの表の要素 [値, セクション, .equ か, 外部か(, 型)] の型（無ければ None）。"""
+    return le[4] if len(le) > 4 else None
+
+
 def _sym_attr(state, name):
     """シンボルの属性を読む（無ければ既定。表は増やさない）。"""
     return state.sym_attrs.get(name, _SYM_ATTR_DEFAULT)
@@ -1164,12 +1217,10 @@ def _reloc_reverse(state, mach, rtype):
 
 def insn_reloc_field_decl(state, rtype):
     """命令欄の記述 (マスク, オフセット, シフト, 補正)。無ければ None。caxx.c の insn_reloc_field_decl()。"""
-    if state is None:
-        return None
     return elf_machine_table(state)['field'].get(rtype)
 
 
-def insn_reloc_field_mask(rtype, state=None):
+def insn_reloc_field_mask(state, rtype):
     """その型が命令語で使うビットのマスク（命令欄でなければ None）。"""
     fd = insn_reloc_field_decl(state, rtype)
     return None if fd is None else fd[0]
@@ -1190,7 +1241,6 @@ def _elf_v2l_second(state, prev, k, v):
     return None
 
 
-_ISLABEL_ALNUM = set(ALPHABET + DIGIT)
 _DIFF_WORD = set(ALPHABET + DIGIT + '_.$')
 
 
@@ -1635,7 +1685,6 @@ class StringUtils:
     符号拡張演算子でもあるので、文字定数の判定は skip_squote_literal に閉じてある。
     """
 
-    _ASCII_UPPER = str.maketrans(LOWER, CAPITAL)
     _upper_cache = {}
 
     @staticmethod
@@ -1644,7 +1693,7 @@ class StringUtils:
         c = StringUtils._upper_cache
         v = c.get(s)
         if v is None:
-            v = s.translate(StringUtils._ASCII_UPPER)
+            v = s.translate(_AUPPER)
             if len(s) <= 64:
                 if len(c) >= 65536:
                     c.clear()
@@ -2069,10 +2118,6 @@ def endouble(a):
         return 0.0
 
 
-enflt = enfloat
-endbl = endouble
-
-
 def _float_brace_result(state, f, name):
     """enflt{} / endbl{} の値を今のモードに合わせる。caxx.c の float_brace_result() と同じ。
 
@@ -2244,11 +2289,7 @@ class _XevalParser:
             self.i += 1
             if isinstance(a, float):
                 a = int(a)
-            if _XV_FUNCS[name] == 32:
-                r = struct.unpack('<f', struct.pack('<I', a & 0xFFFFFFFF))[0]
-            else:
-                r = struct.unpack('<d', struct.pack('<Q', a & 0xFFFFFFFFFFFFFFFF))[0]
-            return self._flt(r)
+            return self._flt(enfloat(a) if _XV_FUNCS[name] == 32 else endouble(a))
         if c.isdigit() and c.isascii() or c == '.':
             return self._number()
         self._fail("bad operand")
@@ -2772,7 +2813,7 @@ class LabelManager:
             cum += rl
         entry = self.state.sections.get(name)
         if entry:
-            entry_pc = entry[2] if len(entry) > 2 else entry[0]
+            entry_pc = entry[2]
             if word_pc >= entry_pc:
                 return cum + (word_pc - entry_pc)
         return None
@@ -2822,8 +2863,8 @@ class LabelManager:
             adj = None if _undef(v) else self._section_relative_offset(sec, v)
             if adj is not None:
                 v = adj
-        is_equ = len(ent) > 2 and ent[2]
-        equ_has_reloc = is_equ and len(ent) > 4 and ent[4] is not None
+        is_equ = ent[2]
+        equ_has_reloc = is_equ and _lbl_rtype(ent) is not None
         e = st.elf
         if e.tracking and not st.error_undefined_label and (not is_equ or equ_has_reloc):
             cv = e.capturing_var
@@ -2854,7 +2895,7 @@ class LabelManager:
         st = self.state
         old = st.labels.get(k)
         if st.relax.pas in (0, 1):
-            if old is not None and not (len(old) > 3 and old[3]):
+            if old is not None and not old[3]:
                 self._report_definition_error(('dup', k), f"label '{k}' is already defined.")
                 return False
         elif st.relax.pas == 2 and k not in st.labels:
@@ -2864,8 +2905,8 @@ class LabelManager:
             self._report_definition_error(('patsym', k), f"'{k}' is a pattern file symbol.")
             return False
         entry = [v, s, is_equ, False]
-        if reloc_type is None and old is not None and len(old) > 4:
-            reloc_type = old[4]
+        if reloc_type is None and old is not None:
+            reloc_type = _lbl_rtype(old)
         if reloc_type is not None:
             entry.append(reloc_type)
         st.labels[k] = entry
@@ -2900,9 +2941,6 @@ class SymbolManager:
         return self.state.symbols.get(StringUtils.upper(w), "")
 
 
-_ENUM_WORD_CHARS = set(DIGIT + ALPHABET + '_')
-
-
 def _enum_name_at(s, idx, names, fold=False):
     """その位置の名前を最長一致で読む（語の途中では一致しない）。返り値は (番号, 次の位置) か (-1, idx)。
 
@@ -2919,7 +2957,7 @@ def _enum_name_at(s, idx, names, fold=False):
         if n <= best_end - idx or StringUtils.upper(s[idx:idx + n]) != nm:
             continue
         e = idx + n
-        if e < len(s) and s[e] in _ENUM_WORD_CHARS:
+        if e < len(s) and s[e] in _WORD_CHARS:
             continue
         best = k
         best_end = e
@@ -3037,7 +3075,7 @@ class ExpressionEvaluator:
                             f"{s[idx:idx + 8]!r} (treated as 0)", set_error=False)
         return x, StringUtils.skipspc(s, idx)
 
-    def xeval(self, x, _=None):
+    def xeval(self, x):
         """flt{} / dbl{} / qad{} の中身を _XevalParser で読む（int か float、不可は ValueError）。
 
         `:ラベル` は 256 ビットの符号付き（caxx.c の xeval_primary()）。未定義は印を立てて 0。
@@ -3095,7 +3133,7 @@ class ExpressionEvaluator:
             h = IEEE754Converter.decimal_eval_expr(t)
         except (ValueError, ZeroDivisionError):
             try:
-                v = self.xeval(t, None)
+                v = self.xeval(t)
             except (ValueError, TypeError, OverflowError, ZeroDivisionError):
                 st.diag(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", set_error=True)
                 h = '0' * 32
@@ -3194,7 +3232,7 @@ class ExpressionEvaluator:
                     x = special[t]
                 else:
                     try:
-                        v = float(self.xeval(t, None))
+                        v = float(self.xeval(t))
                         if not math.isfinite(v):
                             raise OverflowError('non-finite')
                         x = int.from_bytes(struct.pack(fmt, v), "big")
@@ -3207,8 +3245,7 @@ class ExpressionEvaluator:
                 if inner:
                     st.diag(f" error - {kw}{{}}: expression contains undefined label.", set_error=True)
                     v = 0
-                x = (enflt(int(v) & 0xFFFFFFFF) if kw == 'enflt'
-                     else endbl(int(v) & 0xFFFFFFFFFFFFFFFF))
+                x = (enfloat(v) if kw == 'enflt' else endouble(v))
                 x = _float_brace_result(st, x, kw)
         elif s.startswith('not(', idx):
             x, idx = self.expression(s, idx + 4)
@@ -3734,7 +3771,7 @@ class BinaryWriter:
         if st.elf.objfile:
             rela = elf_machine_table(st)['is_rela']
             zeroed = [r for r in st.elf.relocations
-                      if rela or insn_reloc_field_mask(r[3], st) is not None]
+                      if rela or insn_reloc_field_mask(st, r[3]) is not None]
             if zeroed:
                 where = ', '.join(f"{r[0]}+0x{r[1]:x}" for r in zeroed[:4])
                 if len(zeroed) > 4:
@@ -3755,19 +3792,11 @@ class BinaryWriter:
         self._store(position, val)
         return 1
 
-    def outbin2(self, a, x):
-        """1 ワードを溜める（リスティングには出さない）。"""
-        if self.state.should_report_errors():
-            try:
-                self.fwrite(a, int(x), 0)
-            except (OverflowError, ValueError):
-                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=True)
-
-    def outbin(self, a, x):
-        """1 ワードを溜め、`-v` のパス2か対話モードならリスティングにも出す。"""
+    def outbin(self, a, x, listing=True):
+        """1 ワードを溜める。listing なら `-v` のパス2か対話モードでリスティングにも出す。"""
         st = self.state
         if st.should_report_errors():
-            prt = 1 if ((st.relax.pas == 2 and st.verbose) or st.relax.pas == 0) else 0
+            prt = 1 if listing and ((st.relax.pas == 2 and st.verbose) or st.relax.pas == 0) else 0
             try:
                 self.fwrite(a, int(x), prt)
             except (OverflowError, ValueError):
@@ -3811,7 +3840,7 @@ def _captext_words(txt, lw):
             i += 2 if txt[i + 1:i + 2] in ('$', '.') else 1
         elif c == '#' or c in DIGIT:
             i += 1
-            while i < n and (txt[i] in _ISLABEL_ALNUM or txt[i] in '_.'):
+            while i < n and (txt[i] in _WORD_CHARS or txt[i] == '.'):
                 i += 1
         elif c in lw:
             j = i
@@ -3835,29 +3864,19 @@ def _check_syms(elems):
 
 
 class DirectiveProcessor:
-    """パターンファイル側のディレクティブを処理する。
+    """パターンファイル側のディレクティブを処理する（どれを呼ぶかは _PAT_DIRECTIVE_HANDLERS）。
 
-    各ハンドラは担当でなければ False、処理したら True を返す。ディレクティブは
-    書かれた位置から効く（後のものが前を上書きする）ので順序に依存する。
+    各ハンドラは行の欄 i（6 欄）を受け取り、処理したら True、行をディレクティブとして
+    受け付けなかったら False を返す（その行は命令のパターンとして照合にかけられる）。
+    ディレクティブは書かれた位置から効く（後のものが前を上書きする）ので順序に依存する。
     """
 
-    def __init__(self, state, expr_eval, binary_writer, symbol_manager=None, parser=None):
+    def __init__(self, state, expr_eval):
         self.state = state
         self.expr_eval = expr_eval
-        self.binary_writer = binary_writer
-        self.symbol_manager = symbol_manager
-        self.parser = parser
-
-    def add_avoiding_dup(self, l, e):
-        """リストに無ければ足す。"""
-        if e not in l:
-            l.append(e)
-        return l
 
     def clear_symbol(self, i):
         """`.clearsym` — 名前を 1 つ、引数なしなら全部のシンボルを消す。"""
-        if len(i) == 0 or i[0] != '.clearsym':
-            return False
         st = self.state
         if len(i) >= 3 and i[2] != '':
             key = StringUtils.upper(i[2])
@@ -3880,8 +3899,6 @@ class DirectiveProcessor:
         `"..."` 文字列、`[...]` 配列、名前のカンマ並び 集合、集合式 計算された集合、
         裸の名前 コピー（か名前を持つ文字列）、それ以外は数値式。
         """
-        if len(i) == 0 or i[0] != '.setsym':
-            return False
         st = self.state
         cache = DirectiveProcessor._const_setsym_cache
         if i[1]:
@@ -3903,15 +3920,7 @@ class DirectiveProcessor:
             st.diag(" error - .setsym directive requires at least a symbol name", set_error=True)
             return False
 
-        vf = value_field.lstrip(' \t')
-        if vf.startswith('"'):
-            st.strsymbols[key] = ObjectGenerator._txt_template_inner(vf)
-            return True
-        if vf.startswith('['):
-            st.arrsymbols[key] = arr_items_from_text(self.expr_eval, vf)
-            st.arrgen += 1
-            return True
-        if symbol_copy_from_name(st, key, vf) or symbol_set_from_text(st, key, value_field):
+        if self._setsym_special(key, value_field):
             return True
         v = 0
         if value_field:
@@ -3925,10 +3934,24 @@ class DirectiveProcessor:
         st.symbols[key] = v
         return True
 
+    def _setsym_special(self, key, value_field, bump=True):
+        """`.setsym` の値欄が 文字列 `"..."` / 配列 `[...]` / 裸の名前の写し / 集合 なら
+        その表に入れて真。数値式なら偽（呼び出し側が評価する）。bump は配列の世代を進めるか。
+        """
+        st = self.state
+        vf = value_field.lstrip(' \t')
+        if vf.startswith('"'):
+            st.strsymbols[key] = ObjectGenerator._txt_template_inner(vf)
+            return True
+        if vf.startswith('['):
+            st.arrsymbols[key] = arr_items_from_text(self.expr_eval, vf)
+            if bump:
+                st.arrgen += 1
+            return True
+        return symbol_copy_from_name(st, key, vf) or symbol_set_from_text(st, key, value_field)
+
     def bits(self, i):
         """`.bits` — 出力ワードのビット数（1..64）とバイト順を決める。"""
-        if len(i) == 0 or i[0] != '.bits':
-            return False
         st = self.state
         wf = ''
         for f in i[1:3]:
@@ -3968,8 +3991,6 @@ class DirectiveProcessor:
 
     def paddingp(self, i):
         """`.padding` — 隙間を埋める値。"""
-        if len(i) == 0 or i[0] != '.padding':
-            return False
         f = i[2] if len(i) >= 3 and i[2] != '' else i[1] if len(i) >= 2 and i[1] != '' else ''
         v = self.expr_eval.expression_pat(f, 0)[0] if f else 0
         try:
@@ -3980,16 +4001,12 @@ class DirectiveProcessor:
 
     def symbolc(self, i):
         """`.symbolc` — シンボルに使える文字を増やす。"""
-        if len(i) == 0 or i[0] != '.symbolc':
-            return False
         if len(i) > 2 and i[2] != '':
             self.state.swordchars = ALPHABET + DIGIT + i[2]
         return True
 
     def vliwp(self, i):
         """`.vliw` — バンドル幅・命令幅・テンプレート幅・NOP。caxx.c の dir_vliwp() と同じ順と範囲で検査する。"""
-        if len(i) == 0 or i[0] != ".vliw":
-            return False
         st = self.state
         if len(i) < 5:
             st.diag(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i) - 1}", set_error=True)
@@ -4024,9 +4041,7 @@ class DirectiveProcessor:
 
     def epic(self, i):
         """`EPIC::` — インデックスコードの組み合わせごとにテンプレートを宣言する。"""
-        if len(i) == 0 or StringUtils.upper(i[0]) != "EPIC":
-            return False
-        if len(i) <= 1 or i[1] == '':
+        if i[1] == '':
             return False
         if len(i) < 3:
             self.state.diag(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i) - 1}", set_error=True)
@@ -4041,7 +4056,9 @@ class DirectiveProcessor:
                 idx += 1
             else:
                 break
-        self.add_avoiding_dup(self.state.vliw.slotset, [idxs, i[2]])
+        ent = [idxs, i[2]]
+        if ent not in self.state.vliw.slotset:
+            self.state.vliw.slotset.append(ent)
         return True
 
     def _cond_tests_relocated_var(self, cond_src):
@@ -4049,7 +4066,7 @@ class DirectiveProcessor:
         st = self.state
         if not st.elf.objfile or not st.reloc_constraints:
             return False
-        return any(insn_reloc_field_mask(rtype, st) is not None and _word_occurs(var, cond_src)
+        return any(insn_reloc_field_mask(st, rtype) is not None and _word_occurs(var, cond_src)
                    for var, rtype in st.reloc_constraints.items())
 
     def _captext_has_linked_label(self, txt):
@@ -4059,9 +4076,9 @@ class DirectiveProcessor:
         """
         for w in _captext_words(txt, self.state.lwordchars):
             le = self.state.labels.get(w)
-            if le is None or (len(le) > 2 and le[2] and not (len(le) > 4 and le[4] is not None)):
+            if le is None or (le[2] and _lbl_rtype(le) is None):
                 continue
-            if (len(le) > 3 and le[3]) or (le[1] and le[1] != self.state.current_section):
+            if le[3] or (le[1] and le[1] != self.state.current_section):
                 return True
         return False
 
@@ -4150,14 +4167,10 @@ class DirectiveProcessor:
         return triggered, error_code
 
     def _dir_var(self, field):
-        """ディレクティブの変数名欄を正規化する（変数名でなければ None）。"""
-        v = (field or '').strip()
-        if not v or not v.isascii():
-            return None
-        v = v.lower()
-        if not _VARNAME_RE.fullmatch(v):
-            return None
-        self.state.varnames.add(v)
+        """ディレクティブの変数名欄を正規化し、使われた名前として登録する（変数名でなければ None）。"""
+        v = VariableManager._index((field or '').strip())
+        if v is not None:
+            self.state.varnames.add(v)
         return v
 
     def elem_list_expand(self, text):
@@ -4178,8 +4191,6 @@ class DirectiveProcessor:
 
     def check_processing(self, i):
         """`.check` — その変数が捕らえてよいシンボルを制限する。"""
-        if len(i) == 0 or i[0] != '.check':
-            return False
         st = self.state
         if i[1].strip():
             var_field, syms_field = i[1], i[2]
@@ -4207,8 +4218,6 @@ class DirectiveProcessor:
 
     def elftype_processing(self, i):
         """`.elftype` — リロケーション型の名前と番号（と幅・PC 相対か）を決める。"""
-        if len(i) == 0 or i[0] != '.elftype':
-            return False
         st = self.state
         name_field = i[1] if i[1] else i[2]
         value_field = i[2] if i[1] else ''
@@ -4306,8 +4315,6 @@ class DirectiveProcessor:
 
     def _elf_decl_type_text(self, i, dname, attr):
         """型の綴りを 1 つ取る宣言（`.elfextern` / `.elfdwarf`）。"""
-        if len(i) == 0 or i[0] != dname:
-            return False
         t = self._elf_decl_fields(i)[0].strip()
         if not t:
             self.state.diag(f" error - {dname}: relocation type is not specified.", set_error=True)
@@ -4317,8 +4324,6 @@ class DirectiveProcessor:
 
     def elfmachine_processing(self, i):
         """`.elfmachine` — e_machine の既定値（`-m` より弱い）。"""
-        if len(i) == 0 or i[0] != '.elfmachine':
-            return False
         num, nm = self._elf_decl_fields(i)
         v = self._elf_decl_num('.elfmachine', num, 0, 65535)
         if v is None:
@@ -4333,8 +4338,6 @@ class DirectiveProcessor:
 
     def elfclass_processing(self, i):
         """`.elfclass` — ELF32 / ELF64 の既定値（`-f` より弱い）。"""
-        if len(i) == 0 or i[0] != '.elfclass':
-            return False
         text = self._elf_decl_fields(i)[0].strip()
         if text in ('32', '64'):
             self._elf_decl_set('decl_class', 1 if text == '32' else 2)
@@ -4345,8 +4348,6 @@ class DirectiveProcessor:
 
     def elfrela_processing(self, i):
         """`.elfrela` — .rela（加数を欄に持つ）か .rel か。"""
-        if len(i) == 0 or i[0] != '.elfrela':
-            return False
         text = self._elf_decl_fields(i)[0].strip().translate(_ALOWER)
         if text in ('1', 'rela', '0', 'rel'):
             self._elf_decl_set('decl_rela', 1 if text in ('1', 'rela') else 0)
@@ -4357,8 +4358,6 @@ class DirectiveProcessor:
 
     def elfwidth_processing(self, i):
         """`.elfwidth` — 欄の幅（2 のべき乗でなくてよい）から型を推測する対応。"""
-        if len(i) == 0 or i[0] != '.elfwidth':
-            return False
         wf, tf = self._elf_decl_fields(i)
         w = self._elf_decl_num('.elfwidth', wf, 1, 8)
         if w is None:
@@ -4410,8 +4409,6 @@ class DirectiveProcessor:
 
     def _elf_decl_flag(self, i, dname, attr):
         """0 か 1 の宣言（`.elfpcguess` / `.elfrelax` / `.elfbuiltin`）。"""
-        if len(i) == 0 or i[0] != dname:
-            return False
         text = self._elf_decl_fields(i)[0].strip()
         if text in ('0', '1'):
             self._elf_decl_set(attr, int(text))
@@ -4421,8 +4418,6 @@ class DirectiveProcessor:
 
     def _elf_decl_typelist(self, i, dname, lst):
         """型の綴りを宣言順に並べる宣言（`.elfanchor` / `.elfresolve`）。"""
-        if len(i) == 0 or i[0] != dname:
-            return False
         t = self._elf_decl_fields(i)[0].lstrip(' \t').rstrip(' \t\r\n')
         if not t:
             self.state.diag(f" error - {dname}: relocation type is not specified.", set_error=True)
@@ -4433,8 +4428,6 @@ class DirectiveProcessor:
 
     def elfheader_processing(self, i):
         """`.elfheader` — ELF ヘッダの欄（e_flags など）を直接書く。"""
-        if len(i) == 0 or i[0] != '.elfheader':
-            return False
         ff, vf = self._elf_decl_fields(i)
         fld = ff.replace(' ', '').replace('\t', '').translate(_ALOWER)
         rng = DirectiveProcessor._ELF_HDR_FIELDS.get(fld)
@@ -4453,8 +4446,6 @@ class DirectiveProcessor:
         シフトは REL で加数を書き戻す前に右へずらすビット数、補正は加数に足す定数。
         caxx.c の dir_elffield() と同じ規則である。
         """
-        if len(i) == 0 or i[0] != '.elffield':
-            return False
         tf, mf = self._elf_decl_fields(i)
         t = tf.strip()
         if not t:
@@ -4499,8 +4490,6 @@ class DirectiveProcessor:
 
         シンボルが 0（既定）ならシンボル 0・加数 0（R_RISCV_RELAX など）、1 なら元と同じシンボル。
         """
-        if len(i) == 0 or i[0] != '.elfextra':
-            return False
         t, c = self._fld(i, 1), self._fld(i, 2)
         if not t or not c:
             self.state.diag(" error - .elfextra: two relocation types are required.", set_error=True)
@@ -4520,8 +4509,6 @@ class DirectiveProcessor:
 
         第 1 欄が幅ならその幅のデータの欄、型名なら `.reloc` でその型を付けた欄。
         """
-        if len(i) == 0 or i[0] != '.elfdiff':
-            return False
         f1, a, b = self._fld(i, 1), self._fld(i, 2), self._fld(i, 3)
         e = self.state.elf
         typed = bool(f1) and not _PLAIN_NUM_RE.match(f1)
@@ -4538,8 +4525,6 @@ class DirectiveProcessor:
 
     def elfunaligned_processing(self, i):
         """`.elfunaligned::<型>::<代わりの型>` — 幅の倍数でない位置のデータの欄の型。caxx.c の dir_elfunaligned()。"""
-        if len(i) == 0 or i[0] != '.elfunaligned':
-            return False
         t, u = self._fld(i, 1), self._fld(i, 2)
         if not t or not u:
             self.state.diag(" error - .elfunaligned: a relocation type and its unaligned type "
@@ -4550,8 +4535,6 @@ class DirectiveProcessor:
 
     def elfencode_processing(self, i):
         """`.elfencode::<型>::<関数>` — REL で加数を欄へ書き戻す関数（欄の値, 加数）→ 欄。caxx.c の dir_elfencode()。"""
-        if len(i) == 0 or i[0] != '.elfencode':
-            return False
         t, f = self._fld(i, 1), self._fld(i, 2)
         if not t or not f:
             self.state.diag(" error - .elfencode: a relocation type and a function name are required.",
@@ -4562,8 +4545,6 @@ class DirectiveProcessor:
 
     def elfrinfo_processing(self, i):
         """`.elfrinfo` — r_info を組む関数（シンボル番号, 型番号）→ r_info。caxx.c の dir_elfrinfo()。"""
-        if len(i) == 0 or i[0] != '.elfrinfo':
-            return False
         f = self._elf_decl_fields(i)[0].strip()
         if not f:
             self.state.diag(" error - .elfrinfo: a function name is required.", set_error=True)
@@ -4573,8 +4554,6 @@ class DirectiveProcessor:
 
     def elfunit_processing(self, i):
         """`.elfunit` — 加数とシンボル値の単位（byte / word）。caxx.c の dir_elfunit()。"""
-        if len(i) == 0 or i[0] != '.elfunit':
-            return False
         text = self._elf_decl_fields(i)[0].strip().translate(_ALOWER)
         if text in ('byte', 'word'):
             self._elf_decl_set('decl_unit', text)
@@ -4585,8 +4564,6 @@ class DirectiveProcessor:
 
     def elflink_processing(self, i):
         """`.elflink::<セクション>::<sh_link>[::<sh_info>]`（値は名前か数）。caxx.c の dir_elflink()。"""
-        if len(i) == 0 or i[0] != '.elflink':
-            return False
         nm = self._fld(i, 1)
         if not nm:
             self.state.diag(" error - .elflink: section name is not specified.", set_error=True)
@@ -4597,8 +4574,6 @@ class DirectiveProcessor:
 
     def elfcfi_processing(self, i):
         """`.elfcfi::<戻り番地の列>::<コード整列>::<データ整列>[::<詰めの整列>]` — CIE の欄。caxx.c の dir_elfcfi()。"""
-        if len(i) == 0 or i[0] != '.elfcfi':
-            return False
         fld = lambda k: i[k] if len(i) > k else ''
         ra = self._elf_decl_num('.elfcfi', fld(1), 0, 0xFFFF)
         if ra is None:
@@ -4624,8 +4599,6 @@ class DirectiveProcessor:
 
     def elfcfiinit_processing(self, i):
         """`.elfcfiinit` — CIE の初期命令を 1 つ足す（`def_cfa 7, 8` など）。caxx.c の dir_elfcfiinit()。"""
-        if len(i) == 0 or i[0] != '.elfcfiinit':
-            return False
         t = ' '.join(self._elf_decl_fields(i)[0].split())
         if not t:
             self.state.diag(" error - .elfcfiinit: an instruction is required.", set_error=True)
@@ -4635,8 +4608,6 @@ class DirectiveProcessor:
 
     def elfcfireg_processing(self, i):
         """`.elfcfireg` — CFI の指令に書くレジスタ名と DWARF の番号。caxx.c の dir_elfcfireg()。"""
-        if len(i) == 0 or i[0] != '.elfcfireg':
-            return False
         nm = self._fld(i, 1).translate(_ALOWER)
         if not nm:
             self.state.diag(" error - .elfcfireg: a register name is required.", set_error=True)
@@ -4648,8 +4619,6 @@ class DirectiveProcessor:
 
     def elfgroup_processing(self, i):
         """`.elfgroup::<グループ名>::<署名>::<フラグ>::<メンバー>[,...]` — SHT_GROUP。caxx.c の dir_elfgroup()。"""
-        if len(i) == 0 or i[0] != '.elfgroup':
-            return False
         gn, sig = self._fld(i, 1), self._fld(i, 2)
         if not gn or not sig:
             self.state.diag(" error - .elfgroup: a group name and a signature symbol are required.",
@@ -4667,8 +4636,6 @@ class DirectiveProcessor:
 
     def elfsection_processing(self, i):
         """`.elfsection` — 名前から推測できないセクションの sh_flags / sh_type / 整列 / 要素サイズ。"""
-        if len(i) == 0 or i[0] != '.elfsection':
-            return False
         nf, ff = self._elf_decl_fields(i)
         nm = nf.strip()
         if not nm:
@@ -4699,8 +4666,6 @@ class DirectiveProcessor:
         第 5 欄は追加の再配置（8 つまで。オフセットは参照の先頭からのバイト数、同じ
         シンボルと加数。`.elfanchor` の型は行のアンカーを指す）。caxx.c の dir_reloc() と同じ。
         """
-        if len(i) == 0 or i[0] != '.reloc':
-            return False
         st = self.state
         if not i[1].strip():
             st.diag(" error - .reloc: variable name is not specified.", set_error=True)
@@ -4773,8 +4738,6 @@ class DirectiveProcessor:
 
     def _clear_var_dir(self, i, dname, tables, alt_field):
         """`.clrreloc` / `.clrcheck` — 変数 1 つ（引数なしで全部）の宣言を外す。"""
-        if len(i) == 0 or i[0] != dname:
-            return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
         if alt_field and not var_field and len(i) >= 2 and i[1]:
             var_field = i[1].strip()
@@ -4832,8 +4795,6 @@ class DirectiveProcessor:
 
         `.unordered` では名前と値をその変数だけの表に入れる（Z80 の C レジスタと C キャリー）。
         """
-        if len(i) == 0 or i[0] != '.map':
-            return False
         if self.state.unordered:
             var = self._dir_var(i[1].strip() if len(i) >= 2 else '')
             if var is not None:
@@ -4846,14 +4807,12 @@ class DirectiveProcessor:
 
     def unordered_processing(self, i):
         """`.unordered` — 宣言だけ（中身は _pat_unordered_plan() が扱う）。"""
-        return len(i) > 0 and i[0] == '.unordered'
+        return True
 
     def free_processing(self, i):
         """`.free` — 名前をすべての表（シンボル・`.sub`・`.check` の候補、変数なら
         その `.check` / `.enum` / `.reloc`）から外す。位置依存。
         """
-        if len(i) == 0 or i[0] != '.free':
-            return False
         st = self.state
         names = (i[2] if len(i) >= 3 and i[2] else (i[1] if len(i) >= 2 else ''))
         if not names.strip():
@@ -4879,8 +4838,6 @@ class DirectiveProcessor:
 
     def echo_processing(self, i):
         """`.echo` — 本文行から標準エラーへ印字する（ワードは出さない）。"""
-        if len(i) == 0 or i[0] != '.echo':
-            return False
         st = self.state
         if not st.should_report_errors() or st.relax.pass1_size_mode:
             return True
@@ -4921,8 +4878,6 @@ class DirectiveProcessor:
 
     def passthru_processing(self, i):
         """`.passthru` — どのパターンにも当たらない行をエラーにせず素通しする。"""
-        if len(i) == 0 or i[0] != '.passthru':
-            return False
         v = self._onoff(i, '.passthru')
         if v is not None:
             self.state.passthru = v
@@ -4930,8 +4885,6 @@ class DirectiveProcessor:
 
     def eol_processing(self, i):
         """`.eol` — 1 ソース行につき 1 行の改行を自動で入れる。"""
-        if len(i) == 0 or i[0] != '.eol':
-            return False
         v = self._onoff(i, '.eol')
         if v is not None:
             self.state.eol = v
@@ -4939,8 +4892,6 @@ class DirectiveProcessor:
 
     def textmode_processing(self, i):
         """`.textmode` — テキスト置換モード（ラベル・式・コメント・字下げを綴りのまま残す）。"""
-        if len(i) == 0 or i[0] != '.textmode':
-            return False
         v = self._onoff(i, '.textmode')
         if v is not None:
             self.state.textmode = self.state.passthru = self.state.eol = v
@@ -4948,8 +4899,6 @@ class DirectiveProcessor:
 
     def enum_processing(self, i):
         """`.enum` — 要素のリストを取る位置を宣言する（68000 の MOVEM など）。"""
-        if len(i) == 0 or i[0] != '.enum':
-            return False
         st = self.state
         var_field = i[1].strip() if len(i) >= 2 else ''
         names_field = i[2] if len(i) >= 3 else ''
@@ -4976,8 +4925,6 @@ class DirectiveProcessor:
 
     def errmsg_processing(self, i):
         """`.error::n::"文言"` — エラーコードの文言を足す・上書きする。"""
-        if len(i) == 0 or i[0] != '.error':
-            return False
         st = self.state
         n_field = i[1].strip() if len(i) >= 2 else ''
         msg_field = i[2] if len(i) >= 3 else ''
@@ -5007,19 +4954,27 @@ class DirectiveProcessor:
         return True
 
 
-_SYM_CORE = set(DIGIT + ALPHABET + '_')
-
-_PAT_DIRECTIVES = frozenset((
-    '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
-    '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
-    '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
-    '.echo', '.unordered',
-    '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
-    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield',
-    '.elfpcguess', '.elfrelax', '.elfanchor', '.elfresolve', '.elfbuiltin', '.elfextra',
-    '.elfdiff', '.elfencode',
-    '.elfrinfo', '.elfunit', '.elflink', '.elfgroup', '.elfcfi', '.elfcfiinit',
-    '.elfcfireg', '.elfunaligned'))
+# パターンファイルのディレクティブ → DirectiveProcessor のハンドラ名。`EPIC::` は表に無く、
+# ディレクティブ行で表に無いものがそれ（_build_dir_dispatch()）。
+_PAT_DIRECTIVE_HANDLERS = {
+    '.setsym': 'set_symbol', '.clearsym': 'clear_symbol', '.padding': 'paddingp',
+    '.bits': 'bits', '.symbolc': 'symbolc', '.vliw': 'vliwp',
+    '.check': 'check_processing', '.clrcheck': 'clrcheck_processing',
+    '.reloc': 'reloc_processing', '.clrreloc': 'clrreloc_processing',
+    '.map': 'map_processing', '.free': 'free_processing',
+    '.passthru': 'passthru_processing', '.eol': 'eol_processing',
+    '.textmode': 'textmode_processing', '.enum': 'enum_processing',
+    '.clrenum': 'clrenum_processing', '.error': 'errmsg_processing',
+    '.echo': 'echo_processing', '.unordered': 'unordered_processing',
+}
+# ELF 記述の宣言（ソースを読む前に register_elfdecls() が先に通す）。
+_ELF_DECLS = ('.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth', '.elfextern',
+              '.elfdwarf', '.elfheader', '.elfsection', '.elffield', '.elfpcguess', '.elfrelax',
+              '.elfanchor', '.elfresolve', '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
+              '.elfrinfo', '.elfunit', '.elflink', '.elfgroup', '.elfcfi', '.elfcfiinit',
+              '.elfcfireg', '.elfunaligned')
+_PAT_DIRECTIVE_HANDLERS.update((n, n[1:] + '_processing') for n in _ELF_DECLS)
+_PAT_DIRECTIVES = frozenset(_PAT_DIRECTIVE_HANDLERS)
 
 _CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
 _PLAIN_NUM_RE = re.compile(r"^\s*(?:0[xX][0-9a-fA-F]+|[0-9]+)\s*$")
@@ -5190,6 +5145,225 @@ class PatternMatcher:
         else:
             self._sub_spans.setdefault(k, [idx_s, idx_s])[1] = idx_s
 
+    @staticmethod
+    def _skip_stop(s, idx_s, stopchar):
+        """止め文字 stopchar がソースのその位置にあれば食べる。"""
+        if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+            return idx_s + 1
+        return idx_s
+
+    def _cap_float(self, s, t, idx_s, idx_t, a, kind):
+        """`!Fx` / `!Dx` — 浮動小数点の式を読み、IEEE-754 のビット列を a に束縛する。
+
+        返り値は (当たったか, 次の idx_s, 次の idx_t)。
+        """
+        st = self.state
+        stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
+        cap_start = idx_s
+        st.expr_missing = False
+        try:
+            v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+        finally:
+            st.elf.capturing_var = None
+        for k in closes:
+            self._sub_mark(SUB_CLOSE, k, idx_s)
+        self._cap_text(a, s, cap_start, idx_s, stopchar)
+        fmt, bits = ('>f', 32) if kind == 'F' else ('>d', 64)
+        try:
+            # 未定義は 0（報告済み）。整数は 256 ビットの符号付きとして（caxx.c と同じ）。
+            v = 0.0 if _undef(v) else float(_float_int(v))
+            v = int.from_bytes(struct.pack(fmt, v), "big")
+        except (OverflowError, ValueError, struct.error):
+            st.diag(f" error - !{kind}: cannot convert value to float{bits}; using 0.", set_error=True)
+            v = 0
+        self.var_manager.put(a, v)
+        if st.expr_missing:
+            return False, idx_s, idx_t
+        return True, self._skip_stop(s, idx_s, stopchar), idx_t
+
+    def _cap_quad(self, s, t, idx_s, idx_t, a):
+        """`!Qx` — 4 倍精度の式。綴りを binary128 として評価し、だめなら倍精度の値を %.17g で。"""
+        st = self.state
+        stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
+        q_start = idx_s
+        st.expr_missing = False
+        d0_prev = (st.fdiv0_defer, st.fdiv0_seen)
+        st.fdiv0_defer, st.fdiv0_seen = True, False
+        try:
+            v, q_end = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+        finally:
+            st.elf.capturing_var = None
+            d0 = st.fdiv0_seen
+            st.fdiv0_defer, st.fdiv0_seen = d0_prev
+        for k in closes:
+            self._sub_mark(SUB_CLOSE, k, q_end)
+        self._cap_text(a, s, q_start, q_end, stopchar)
+        raw = s[q_start:q_end]
+        if stopchar != chr(0) and raw.endswith(stopchar):
+            raw = raw[:-1]
+        # 前後の空白は落とさず、終端の NUL だけ落とす（caxx.c と同じ）。
+        raw = raw.split(chr(0), 1)[0]
+        if len(raw) > 4 and raw.startswith('qad{') and raw.endswith('}'):
+            raw = raw[4:-1]
+        # 4 倍精度の式として評価し、だめなら倍精度の値を %.17g で（caxx.c と同じ順）。
+        if _undef(v):
+            h = '0' * 32
+        else:
+            try:
+                if not raw:
+                    raise ValueError
+                h = IEEE754Converter.decimal_eval_expr(raw)
+                d0 = False
+            except (ValueError, ZeroDivisionError):
+                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                    raw if raw in ('inf', '-inf', 'nan') else _g17(_float_of(v)))
+        if d0:
+            st.diag(" error - Division by 0 error.", set_error=True)
+        self.var_manager.put(a, int(h, 16))
+        if st.expr_missing:
+            return False, q_end, idx_t
+        return True, self._skip_stop(s, q_end, stopchar), idx_t
+
+    def _cap_label(self, s, t, idx_s, idx_t, a):
+        """`!Lx` — 式の値と綴りの両方を捕らえる（`.textmode` では未定義ラベルを 0 として続ける）。"""
+        st = self.state
+        ev = self.expr_eval
+        stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
+        text_start = idx_s
+        st.elf.capturing_var = a
+        cap_prior = st.error_undefined_label
+        st.error_undefined_label = False
+        st.expr_missing = False
+        lcap_prior = st._textmode_lcap
+        if st.textmode:
+            st._textmode_lcap = True
+        try:
+            v, idx_s = ev.expression_esc(s, idx_s, stopchar)
+        finally:
+            st.elf.capturing_var = None
+            st._textmode_lcap = lcap_prior
+        cap_undef = st.error_undefined_label
+        for k in closes:
+            self._sub_mark(SUB_CLOSE, k, idx_s)
+        raw = s[text_start:idx_s]
+        if stopchar != chr(0) and raw.endswith(stopchar):
+            raw = raw[:-1]
+        self._cap_text(a, s, text_start, idx_s, stopchar)
+        _elf_v2l_finish(st, a, raw, ev.loc_counter_value)
+        if st.textmode:
+            st.error_undefined_label = cap_prior
+            if cap_undef or _is_undef_derived(v):
+                v = 0
+            self.var_manager.put_tagged(a, v, False)
+        else:
+            st.error_undefined_label = cap_prior or cap_undef
+            self.var_manager.put_tagged(a, v, cap_undef)
+        if st.expr_missing:
+            return False, idx_s, idx_t
+        return True, self._skip_stop(s, idx_s, stopchar), idx_t
+
+    def _cap_expr(self, s, t, idx_s, idx_t, a, factor_only):
+        """`!x`（止め文字までの式）と `!!x`（因子 1 個）。"""
+        st = self.state
+        ev = self.expr_eval
+        if factor_only:
+            stopchar, closes = chr(0), ()
+        else:
+            stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
+        st.elf.capturing_var = a
+        cap_prior = st.error_undefined_label
+        st.error_undefined_label = False
+        cap_start = idx_s
+        st.expr_missing = False
+        try:
+            if factor_only:
+                v, idx_s = ev.factor(s, idx_s)
+            else:
+                v, idx_s = ev.expression_esc(s, idx_s, stopchar)
+        finally:
+            st.elf.capturing_var = None
+        for k in closes:
+            self._sub_mark(SUB_CLOSE, k, idx_s)
+        _elf_v2l_finish(st, a, s[cap_start:idx_s], ev.loc_counter_value)
+        self._cap_text(a, s, cap_start, idx_s, stopchar)
+        cap_undef = st.error_undefined_label
+        st.error_undefined_label = cap_prior or cap_undef
+        self.var_manager.put_tagged(a, v, cap_undef)
+        if st.expr_missing:
+            return False, idx_s, idx_t
+        return True, self._skip_stop(s, idx_s, stopchar), idx_t
+
+    def _cap_enum(self, s, idx_s, a):
+        """`!Ex` — `.enum` の要素のリスト。返り値は (当たったか, 次の idx_s)。"""
+        edef = self.state.enum_defs.get(a)
+        if edef is None:
+            return False, idx_s
+        hit = self._enum_capture(s, idx_s, edef)
+        if hit is None:
+            return False, idx_s
+        cap_start = idx_s
+        v, idx_s = hit
+        self.var_manager.put(a, v)
+        self._cap_text(a, s, cap_start, idx_s)
+        return True, idx_s
+
+    def _cap_symset(self, s, idx_s, a, setkey):
+        """`!Y集合[x]` — 集合の項目名を最長一致で読み、その番号を束縛する。"""
+        arr = self.state.arrsymbols.get(setkey)
+        if not arr:
+            return False, idx_s
+        yk, yend = _symset_item_at(s, idx_s, arr)
+        if yk < 0:
+            return False, idx_s
+        self._cap_text(a, s, idx_s, yend)
+        self.var_manager.put(a, yk)
+        return True, yend
+
+    def _cap_symbol(self, s, idx_s, a):
+        """小文字の名前 — シンボルを 1 語読む（`.check` の候補・`.unordered` の `.map` の表に従う）。
+
+        返り値は (当たったか, 次の idx_s)。`""` を許す `.check` では無くても当たる。
+        """
+        st = self.state
+        prev_idx_s = idx_s
+        allowed = st.check_constraints.get(a)
+        allow_omit = allowed is not None and CHECK_OMIT in allowed
+        # `.unordered` の `.map` の変数ごとの表があれば値はそこから（caxx.c の cap_sym_get()）。
+        tbl = st.var_tables.get(a)
+        sget = self.symbol_manager.get if tbl is None \
+            else (lambda w_, t_=tbl: t_.get(StringUtils.upper(w_), ""))
+        w, idx_s = self.parser.get_symbol_word(s, idx_s)
+        v = sget(w)
+        if v == "":
+            # 語の途中の記号で切って短い名前を試す（`(IX-5)` の `IX`）。
+            for cut in range(len(w) - 1, 0, -1):
+                if w[cut] in _WORD_CHARS:
+                    continue
+                v2 = sget(w[:cut])
+                if v2 != "":
+                    w, v, idx_s = w[:cut], v2, prev_idx_s + cut
+                    break
+        ok = v != "" and idx_s != prev_idx_s and (allowed is None or w in allowed)
+        if not ok and allowed:
+            best = ''
+            for nm in allowed:
+                if nm and len(nm) > len(best) and \
+                        StringUtils.upper(s[prev_idx_s:prev_idx_s + len(nm)]) == nm:
+                    best = nm
+            if best:
+                v2 = sget(best)
+                if v2 != "":
+                    w, v, idx_s, ok = best, v2, prev_idx_s + len(best), True
+        if not ok:
+            if not allow_omit:
+                return False, idx_s
+            self.var_manager.put(a, VAR_UNDEF)
+            st.vars_text[a] = ''
+            return True, prev_idx_s
+        self.var_manager.put(a, v)
+        self._cap_text(a, s, prev_idx_s, idx_s)
+        return True, idx_s
+
     def match(self, s, t):
         """ソース行 s とパターン t を 1 文字ずつ突き合わせる。
 
@@ -5198,8 +5372,6 @@ class PatternMatcher:
         `!Y集合[変数]` は集合の項目番号。当たれば last_score に特異度を残す。
         式の捕捉で因子が欠けていればそのパターンは当たらない。
         """
-        st = self.state
-        ev = self.expr_eval
         n_expr = n_sym = n_lit = 0
         # `[[xxx]]yyy` は `xxx yyy` として読む（rep と p が repp につながらない。caxx.c の pat_match()）。
         t = t.replace(OB, '').replace(CB, ' ')
@@ -5209,11 +5381,6 @@ class PatternMatcher:
         t += chr(0)
         prev_alnum = False
         self._sub_spans = {}
-
-        def skip_stop(idx_s, stopchar):
-            if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
-                return idx_s + 1
-            return idx_s
 
         while True:
             s_sp = idx_s < len(s) and s[idx_s] in ' \t'
@@ -5283,201 +5450,33 @@ class PatternMatcher:
                 idx_t += nl
 
                 if kind in ('F', 'D'):
-                    stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
-                    cap_start = idx_s
-                    st.expr_missing = False
-                    try:
-                        v, idx_s = ev.expression_esc_float(s, idx_s, stopchar)
-                    finally:
-                        st.elf.capturing_var = None
-                    for k in closes:
-                        self._sub_mark(SUB_CLOSE, k, idx_s)
-                    self._cap_text(a, s, cap_start, idx_s, stopchar)
-                    fmt, bits = ('>f', 32) if kind == 'F' else ('>d', 64)
-                    try:
-                        # 未定義は 0（報告済み）。整数は 256 ビットの符号付きとして（caxx.c と同じ）。
-                        v = 0.0 if _undef(v) else float(_float_int(v))
-                        v = int.from_bytes(struct.pack(fmt, v), "big")
-                    except (OverflowError, ValueError, struct.error):
-                        st.diag(f" error - !{kind}: cannot convert value to float{bits}; using 0.", set_error=True)
-                        v = 0
-                    self.var_manager.put(a, v)
-                    if st.expr_missing:
-                        return False
-                    idx_s = skip_stop(idx_s, stopchar)
+                    ok, idx_s, idx_t = self._cap_float(s, t, idx_s, idx_t, a, kind)
                 elif kind == 'Q':
-                    stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
-                    q_start = idx_s
-                    st.expr_missing = False
-                    d0_prev = (st.fdiv0_defer, st.fdiv0_seen)
-                    st.fdiv0_defer, st.fdiv0_seen = True, False
-                    try:
-                        v, q_end = ev.expression_esc_float(s, idx_s, stopchar)
-                    finally:
-                        st.elf.capturing_var = None
-                        d0 = st.fdiv0_seen
-                        st.fdiv0_defer, st.fdiv0_seen = d0_prev
-                    for k in closes:
-                        self._sub_mark(SUB_CLOSE, k, q_end)
-                    self._cap_text(a, s, q_start, q_end, stopchar)
-                    raw = s[q_start:q_end]
-                    if stopchar != chr(0) and raw.endswith(stopchar):
-                        raw = raw[:-1]
-                    # 前後の空白は落とさず、終端の NUL だけ落とす（caxx.c と同じ）。
-                    raw = raw.split(chr(0), 1)[0]
-                    if len(raw) > 4 and raw.startswith('qad{') and raw.endswith('}'):
-                        raw = raw[4:-1]
-                    # 4 倍精度の式として評価し、だめなら倍精度の値を %.17g で（caxx.c と同じ順）。
-                    if _undef(v):
-                        h = '0' * 32
-                    else:
-                        try:
-                            if not raw:
-                                raise ValueError
-                            h = IEEE754Converter.decimal_eval_expr(raw)
-                            d0 = False
-                        except (ValueError, ZeroDivisionError):
-                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                raw if raw in ('inf', '-inf', 'nan') else _g17(_float_of(v)))
-                    if d0:
-                        st.diag(" error - Division by 0 error.", set_error=True)
-                    self.var_manager.put(a, int(h, 16))
-                    if st.expr_missing:
-                        return False
-                    idx_s = skip_stop(q_end, stopchar)
+                    ok, idx_s, idx_t = self._cap_quad(s, t, idx_s, idx_t, a)
                 elif kind == 'L':
-                    stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
-                    text_start = idx_s
-                    st.elf.capturing_var = a
-                    cap_prior = st.error_undefined_label
-                    st.error_undefined_label = False
-                    st.expr_missing = False
-                    lcap_prior = st._textmode_lcap
-                    if st.textmode:
-                        st._textmode_lcap = True
-                    try:
-                        v, idx_s = ev.expression_esc(s, idx_s, stopchar)
-                    finally:
-                        st.elf.capturing_var = None
-                        st._textmode_lcap = lcap_prior
-                    cap_undef = st.error_undefined_label
-                    for k in closes:
-                        self._sub_mark(SUB_CLOSE, k, idx_s)
-                    raw = s[text_start:idx_s]
-                    if stopchar != chr(0) and raw.endswith(stopchar):
-                        raw = raw[:-1]
-                    self._cap_text(a, s, text_start, idx_s, stopchar)
-                    _elf_v2l_finish(st, a, raw, ev.loc_counter_value)
-                    if st.textmode:
-                        st.error_undefined_label = cap_prior
-                        if cap_undef or _is_undef_derived(v):
-                            v = 0
-                        self.var_manager.put_tagged(a, v, False)
-                    else:
-                        st.error_undefined_label = cap_prior or cap_undef
-                        self.var_manager.put_tagged(a, v, cap_undef)
-                    if st.expr_missing:
-                        return False
-                    idx_s = skip_stop(idx_s, stopchar)
+                    ok, idx_s, idx_t = self._cap_label(s, t, idx_s, idx_t, a)
                 elif kind == 'E':
-                    edef = st.enum_defs.get(a)
-                    if edef is None:
-                        return False
-                    hit = self._enum_capture(s, idx_s, edef)
-                    if hit is None:
-                        return False
-                    cap_start = idx_s
-                    v, idx_s = hit
-                    self.var_manager.put(a, v)
-                    self._cap_text(a, s, cap_start, idx_s)
+                    ok, idx_s = self._cap_enum(s, idx_s, a)
                 elif kind == 'Y':
                     if t[idx_t] != ']':
                         return False
                     idx_t += 1
-                    arr = st.arrsymbols.get(setkey)
-                    if not arr:
-                        return False
-                    yk, yend = _symset_item_at(s, idx_s, arr)
-                    if yk < 0:
-                        return False
-                    self._cap_text(a, s, idx_s, yend)
-                    idx_s = yend
-                    self.var_manager.put(a, yk)
+                    ok, idx_s = self._cap_symset(s, idx_s, a, setkey)
                     n_expr -= 1
                     n_sym += 1
                 else:
-                    # `!!x`（因子）と `!x`（止め文字までの式）。
-                    if kind == '!':
-                        stopchar, closes = chr(0), ()
-                    else:
-                        stopchar, idx_t, closes = self._var_stopchar(t, idx_t)
-                    st.elf.capturing_var = a
-                    cap_prior = st.error_undefined_label
-                    st.error_undefined_label = False
-                    cap_start = idx_s
-                    st.expr_missing = False
-                    try:
-                        if kind == '!':
-                            v, idx_s = ev.factor(s, idx_s)
-                        else:
-                            v, idx_s = ev.expression_esc(s, idx_s, stopchar)
-                    finally:
-                        st.elf.capturing_var = None
-                    for k in closes:
-                        self._sub_mark(SUB_CLOSE, k, idx_s)
-                    _elf_v2l_finish(st, a, s[cap_start:idx_s], ev.loc_counter_value)
-                    self._cap_text(a, s, cap_start, idx_s, stopchar)
-                    cap_undef = st.error_undefined_label
-                    st.error_undefined_label = cap_prior or cap_undef
-                    self.var_manager.put_tagged(a, v, cap_undef)
-                    if st.expr_missing:
-                        return False
-                    idx_s = skip_stop(idx_s, stopchar)
+                    ok, idx_s, idx_t = self._cap_expr(s, t, idx_s, idx_t, a, kind == '!')
+                if not ok:
+                    return False
                 continue
             if a in LOWER:
                 prev_alnum = False
                 nl = self._var_name_at(t, idx_t)
                 a = self._var_declare(t[idx_t:idx_t + nl])
                 idx_t += nl
-                prev_idx_s = idx_s
-                allowed = st.check_constraints.get(a)
-                allow_omit = allowed is not None and CHECK_OMIT in allowed
-                # `.unordered` の `.map` の変数ごとの表があれば値はそこから（caxx.c の cap_sym_get()）。
-                tbl = st.var_tables.get(a)
-                sget = self.symbol_manager.get if tbl is None \
-                    else (lambda w_, t_=tbl: t_.get(StringUtils.upper(w_), ""))
-                w, idx_s = self.parser.get_symbol_word(s, idx_s)
-                v = sget(w)
-                if v == "":
-                    # 語の途中の記号で切って短い名前を試す（`(IX-5)` の `IX`）。
-                    for cut in range(len(w) - 1, 0, -1):
-                        if w[cut] in _SYM_CORE:
-                            continue
-                        v2 = sget(w[:cut])
-                        if v2 != "":
-                            w, v, idx_s = w[:cut], v2, prev_idx_s + cut
-                            break
-                ok = v != "" and idx_s != prev_idx_s and (allowed is None or w in allowed)
-                if not ok and allowed:
-                    best = ''
-                    for nm in allowed:
-                        if nm and len(nm) > len(best) and \
-                                StringUtils.upper(s[prev_idx_s:prev_idx_s + len(nm)]) == nm:
-                            best = nm
-                    if best:
-                        v2 = sget(best)
-                        if v2 != "":
-                            w, v, idx_s, ok = best, v2, prev_idx_s + len(best), True
+                ok, idx_s = self._cap_symbol(s, idx_s, a)
                 if not ok:
-                    if not allow_omit:
-                        return False
-                    idx_s = prev_idx_s
-                    self.var_manager.put(a, VAR_UNDEF)
-                    st.vars_text[a] = ''
-                    n_sym += 1
-                    continue
-                self.var_manager.put(a, v)
-                self._cap_text(a, s, prev_idx_s, idx_s)
+                    return False
                 n_sym += 1
                 continue
             if a == '+' and b == '-' and _expects_expr(t, idx_t + 1):
@@ -5651,6 +5650,44 @@ class PatternMatcher:
         return False
 
 
+class _PatComments:
+    """パターンファイルの `/* ... */` を行ごとに落とす（状態は行をまたぐ）。
+
+    後方互換: 古い「全行の先頭に `/*`」の書き方のため、すぐ次の行も `/*` で始まるか、
+    以降どこにも `*/` が無ければ、`/*` は自分の行を超えて延長しない。
+    """
+
+    def __init__(self, expanded):
+        self.lines = expanded
+        n = len(expanded)
+        # rest_has_close[i]: i 行目以降のどこかに `*/` があるか。
+        self.rest_has_close = [False] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            self.rest_has_close[i] = self.rest_has_close[i + 1] or ('*/' in expanded[i][0])
+        self.open = False
+        self.legacy_chain = False
+
+    @staticmethod
+    def _opens(s):
+        return s.lstrip(' \t').startswith('/*')
+
+    def strip(self, li, l):
+        """li 行目の l からコメントを落とす。"""
+        was_open = self.open
+        l, self.open = StringUtils.remove_comment(l, self.open)
+        if not self.open:
+            self.legacy_chain = False
+        elif not was_open:
+            bare_open = self._opens(self.lines[li][0])
+            legacy = (self.legacy_chain and bare_open) or (
+                li + 1 < len(self.lines) and self._opens(self.lines[li + 1][0])) \
+                or not self.rest_has_close[li + 1]
+            if legacy:
+                self.open = False
+            self.legacy_chain = legacy and bare_open
+        return l
+
+
 class PatternFileReader:
     """パターンファイルを読み、行を欄に割った表にする。
 
@@ -5669,8 +5706,8 @@ class PatternFileReader:
         """パターンファイル 1 つを読み、パターン行の表を返す。
 
         `.INCLUDE` は 50 段まで、循環は報告して飛ばす、相対パスはそのファイルの場所から。
-        コメントの後方互換: 古い「全行の先頭に `/*`」の書き方のため、すぐ次の行も `/*` で
-        始まるか、以降どこにも `*/` が無ければ、`/*` は自分の行を超えて延長しない。
+        行ごとに コメント除去 → `.func` の本文集め → `.echo` → `.INCLUDE` → `::` で欄に割る →
+        `.sub` の本文集め → 表へ、の順。
         """
         if fn == '':
             return []
@@ -5704,80 +5741,16 @@ class PatternFileReader:
         raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
         expanded = list(self.macro_proc.expand(raw_lines, fn))
-        rest_has_close = [False] * (len(expanded) + 1)
-        for i in range(len(expanded) - 1, -1, -1):
-            rest_has_close[i] = rest_has_close[i + 1] or ('*/' in expanded[i][0])
-
-        def opens_comment(s):
-            return s.lstrip(' \t').startswith('/*')
-
-        in_block_comment = False
-        legacy_chain = False
+        comments = _PatComments(expanded)
         cur_sub = None
         func_stack = []
         for _li, (l, _mfile, _mln) in enumerate(expanded):
-
-            was_in_comment = in_block_comment
-            l, in_block_comment = StringUtils.remove_comment(l, in_block_comment)
-            if not in_block_comment:
-                legacy_chain = False
-            elif not was_in_comment:
-                bare_open = opens_comment(expanded[_li][0])
-                legacy = (legacy_chain and bare_open) or (
-                    _li + 1 < len(expanded) and opens_comment(expanded[_li + 1][0])) \
-                    or not rest_has_close[_li + 1]
-                if legacy:
-                    in_block_comment = False
-                legacy_chain = legacy and bare_open
+            l = comments.strip(_li, l)
             l = StringUtils.reduce_spaces(l.replace('\t', ' ').replace('\r', '').replace('\n', ''))
 
             _dk = _dot_kw(l)
             if func_stack or _dk == '.FUNC':
-                if _dk == '.FUNC':
-                    _nm, _ps, _hdr_err = _parse_func_header(l)
-                    parent = func_stack[-1] if func_stack else None
-                    if _hdr_err is not None:
-                        diag(_hdr_err, set_error=True)
-                        _nm = None
-                    elif not _is_sub_name(_nm):
-                        diag(f" error - '.func' needs a name made of letters, digits "
-                             f"and '_': {_nm!r}", set_error=True)
-                        _nm = None
-                    else:
-                        for _p in _ps:
-                            if not _is_sub_name(_p):
-                                diag(f" error - '.func {_nm}': bad parameter name {_p!r}",
-                                     set_error=True)
-                                _nm = None
-                                break
-                    if _nm is not None:
-                        _fn_obj = _MiniFunc(_nm, _ps, parent, fn, _mln)
-                        target = parent.children if parent else self.funcs
-                        if _nm in target:
-                            diag(f" warning - function {_nm!r} is defined more than "
-                                 f"once; the later definition wins.", set_error=False)
-                        target[_nm] = _fn_obj
-                        func_stack.append(_fn_obj)
-                    else:
-                        func_stack.append(_MiniFunc('?', [], parent, fn, _mln))
-                    continue
-                cur = func_stack[-1]
-                if _dk == '.ENDFUNC':
-                    if cur.depth != 0:
-                        diag(f" error - '.func {cur.name}': '.endfunc' while a block "
-                             f"('.if'/'.while'/'.for') is still open.", set_error=True)
-                    func_stack.pop()
-                    continue
-                if _dk in _MINI_OPEN:
-                    cur.depth += 1
-                elif _dk in _MINI_CLOSE:
-                    cur.depth -= 1
-                    if cur.depth < 0:
-                        diag(f" error - '.func::{cur.name}': {_dk.translate(_ALOWER)} without a "
-                             f"matching block opener.", set_error=True)
-                        cur.depth = 0
-                if l.strip():
-                    cur.lines.append((l, fn, _mln))
+                self._func_line(l, _dk, fn, _mln, func_stack)
                 continue
 
             if _dk == '.ECHO':
@@ -5796,44 +5769,11 @@ class PatternFileReader:
             if ww is not None:
                 w = w + ww
                 continue
-            r = []
-            idx = 0
-            while True:
-                fld, idx = self.parser.get_params1(l, idx)
-                r.append(fld)
-                if len(l) <= idx:
-                    break
-            l = r
+            l = self._split_fields(l)
 
             _kw = StringUtils.upper(l[0].strip())
-            if _kw == '.SUB':
-                _nm = (l[1] if len(l) > 1 else '').strip()
-                if cur_sub is not None:
-                    diag(f" error - '.sub' inside '.sub::{cur_sub}': sub tables "
-                         f"cannot be nested.", set_error=True)
-                elif not _is_sub_name(_nm):
-                    diag(f" error - '.sub' needs a table name made of letters, "
-                         f"digits and '_': {_nm!r}", set_error=True)
-                else:
-                    if _nm in self.subs:
-                        diag(f" warning - sub table {_nm!r} is defined more than "
-                             f"once; the later definition wins.", set_error=False)
-                    cur_sub = _nm
-                    self.subs[_nm] = []
-                continue
-            if _kw == '.RETURN' or _kw == '.ENDSUB':
-                if cur_sub is None:
-                    diag(f" error - '{_kw.translate(_ALOWER)}' without a matching '.sub'.",
-                         set_error=True)
-                cur_sub = None
-                continue
-            if cur_sub is not None:
-                if len(l) < 2:
-                    if l[0].strip() != '':
-                        diag(f" error - sub table {cur_sub!r}: entry has no '::' "
-                             f"field separator: {l[0]!r}", set_error=True)
-                    continue
-                self.subs[cur_sub].append((l[0], l[-1]))
+            consumed, cur_sub = self._sub_line(l, _kw, cur_sub)
+            if consumed:
                 continue
 
             if _kw == '.MAP':
@@ -5842,7 +5782,7 @@ class PatternFileReader:
                     diag(" error - .map: needs '.map::<variable>::"
                          "<name,name,...>[::<expression in the variable>]'.",
                          set_error=True)
-                elif self._dir_var_name(var_str) is None:
+                elif VariableManager._index(var_str) is None:
                     diag(f" error - .map: variable should be a lower case "
                          f"name ({var_str!r}).", set_error=True)
 
@@ -5862,7 +5802,7 @@ class PatternFileReader:
             # 2 欄なら 2 つ目は binary_list（第 3 欄）。
             w.append([l[0], '', l[1], '', '', ''] if len(l) == 2 else (l + [''] * 6)[:6])
 
-        if in_block_comment:
+        if comments.open:
             diag(f" warning - pattern file '{fn}' ends while a /* ... */ comment "
                  f"is still open (missing closing '*/').", set_error=False)
         if cur_sub is not None:
@@ -5879,14 +5819,95 @@ class PatternFileReader:
 
         return w
 
-    @staticmethod
-    def _dir_var_name(field):
-        """ディレクティブの変数名欄を読む（読み込み時用の軽い版）。"""
-        v = (field or '').strip()
-        if not v or not v.isascii():
-            return None
-        v = v.lower()
-        return v if _VARNAME_RE.fullmatch(v) else None
+    def _split_fields(self, l):
+        """行を `::` で欄に割る（`"..."` の中では割らない）。"""
+        r = []
+        idx = 0
+        while True:
+            fld, idx = self.parser.get_params1(l, idx)
+            r.append(fld)
+            if len(l) <= idx:
+                return r
+
+    def _func_line(self, l, dk, fn, mln, func_stack):
+        """`.func` 〜 `.endfunc` の行を集める（func_stack は開いている関数の積み。入れ子も可）。"""
+        if dk == '.FUNC':
+            _nm, _ps, _hdr_err = _parse_func_header(l)
+            parent = func_stack[-1] if func_stack else None
+            if _hdr_err is not None:
+                diag(_hdr_err, set_error=True)
+                _nm = None
+            elif not _is_sub_name(_nm):
+                diag(f" error - '.func' needs a name made of letters, digits "
+                     f"and '_': {_nm!r}", set_error=True)
+                _nm = None
+            else:
+                for _p in _ps:
+                    if not _is_sub_name(_p):
+                        diag(f" error - '.func {_nm}': bad parameter name {_p!r}",
+                             set_error=True)
+                        _nm = None
+                        break
+            if _nm is not None:
+                _fn_obj = _MiniFunc(_nm, _ps, parent, fn, mln)
+                target = parent.children if parent else self.funcs
+                if _nm in target:
+                    diag(f" warning - function {_nm!r} is defined more than "
+                         f"once; the later definition wins.", set_error=False)
+                target[_nm] = _fn_obj
+                func_stack.append(_fn_obj)
+            else:
+                func_stack.append(_MiniFunc('?', [], parent, fn, mln))
+            return
+        cur = func_stack[-1]
+        if dk == '.ENDFUNC':
+            if cur.depth != 0:
+                diag(f" error - '.func {cur.name}': '.endfunc' while a block "
+                     f"('.if'/'.while'/'.for') is still open.", set_error=True)
+            func_stack.pop()
+            return
+        if dk in _MINI_OPEN:
+            cur.depth += 1
+        elif dk in _MINI_CLOSE:
+            cur.depth -= 1
+            if cur.depth < 0:
+                diag(f" error - '.func::{cur.name}': {dk.translate(_ALOWER)} without a "
+                     f"matching block opener.", set_error=True)
+                cur.depth = 0
+        if l.strip():
+            cur.lines.append((l, fn, mln))
+
+    def _sub_line(self, l, kw, cur_sub):
+        """`.sub` / `.return` / `.endsub` と、サブ表の中の行。返り値は (この行を消費したか, 開いている表の名前)。"""
+        if kw == '.SUB':
+            _nm = (l[1] if len(l) > 1 else '').strip()
+            if cur_sub is not None:
+                diag(f" error - '.sub' inside '.sub::{cur_sub}': sub tables "
+                     f"cannot be nested.", set_error=True)
+            elif not _is_sub_name(_nm):
+                diag(f" error - '.sub' needs a table name made of letters, "
+                     f"digits and '_': {_nm!r}", set_error=True)
+            else:
+                if _nm in self.subs:
+                    diag(f" warning - sub table {_nm!r} is defined more than "
+                         f"once; the later definition wins.", set_error=False)
+                cur_sub = _nm
+                self.subs[_nm] = []
+            return True, cur_sub
+        if kw == '.RETURN' or kw == '.ENDSUB':
+            if cur_sub is None:
+                diag(f" error - '{kw.translate(_ALOWER)}' without a matching '.sub'.",
+                     set_error=True)
+            return True, None
+        if cur_sub is not None:
+            if len(l) < 2:
+                if l[0].strip() != '':
+                    diag(f" error - sub table {cur_sub!r}: entry has no '::' "
+                         f"field separator: {l[0]!r}", set_error=True)
+            else:
+                self.subs[cur_sub].append((l[0], l[-1]))
+            return True, cur_sub
+        return False, cur_sub
 
     @staticmethod
     def _map_subst_index(expr, var, i):
@@ -6048,24 +6069,9 @@ _MINI_OPS1 = frozenset('+-*/%&|^~<>!()[]:,=')
 _MINI_ESC = {'\\': '\\', '"': '"', 'n': '\n', 't': '\t'}
 
 
-def _mini_bytes(text):
-    """ソースの文字列をミニ言語の文字列（UTF-8 のバイト列。長さも添字もバイト単位）にする。"""
-    return text.encode('utf-8', 'surrogateescape')
-
-
 def _mini_dec(v):
     """整数を符号付き 10 進の文字列（バイト列）にする。"""
     return str(_mini_signed(v)).encode('ascii')
-
-
-def _ascii_alpha(c):
-    """ASCII の英字か（ミニ言語の名前は ASCII の英数字と `_`。caxx.c と同じ）。"""
-    return ('a' <= c <= 'z') or ('A' <= c <= 'Z')
-
-
-def _ascii_alnum(c):
-    """ASCII の英数字か。"""
-    return _ascii_alpha(c) or ('0' <= c <= '9')
 
 
 def _mini_lex(text, pos):
@@ -6077,7 +6083,7 @@ def _mini_lex(text, pos):
     where = f"{pos[0]}:{pos[1]}"
 
     def word_end(j, extra='_'):
-        while j < n and (_ascii_alnum(t[j]) or t[j] in extra):
+        while j < n and (_aan(t[j]) or t[j] in extra):
             j += 1
         return j
 
@@ -6102,7 +6108,7 @@ def _mini_lex(text, pos):
                     j += 1
                 toks.append(('num', int(t[i:j].replace('_', ''))))
             i = j
-        elif _ascii_alpha(c) or c == '_':
+        elif _aa(c) or c == '_':
             j = word_end(i)
             toks.append(('name', t[i:j]))
             i = j
@@ -6147,7 +6153,7 @@ def _mini_lex(text, pos):
                 else:
                     buf.append(ch)
                     j += 1
-            toks.append(('str', _mini_bytes(''.join(buf))))
+            toks.append(('str', _mb(''.join(buf))))
             i = j
         elif t[i:i + 2] in _MINI_OPS2:
             toks.append(('op', t[i:i + 2]))
@@ -7129,7 +7135,6 @@ class MiniInterp:
         return self.out, ret
 
 
-_TXT_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"'}
 _ASMTEXT_SHOW = {'\n': '\\n', '\t': '\\t', '\r': '\\r', '\\': '\\\\', '"': '\\"'}
 
 
@@ -7159,10 +7164,9 @@ class ObjectGenerator:
     ミニ言語の `.call f(...)`。頭の `;` は値が 0 なら出さず、`;;` は評価だけ、空要素は整列。
     """
 
-    def __init__(self, state, expr_eval, binary_writer):
+    def __init__(self, state, expr_eval):
         self.state = state
         self.expr_eval = expr_eval
-        self.binary_writer = binary_writer
         self.call_text = None
 
     def replace_percent_with_index(self, s):
@@ -7302,7 +7306,7 @@ class ObjectGenerator:
         self.call_text = None
         idx = StringUtils.skipspc(s, idx + 5)
         j = idx
-        while j < len(s) and s[j] in _SYM_CORE:
+        while j < len(s) and s[j] in _WORD_CHARS:
             j += 1
         name = s[idx:j]
         idx = StringUtils.skipspc(s, j)
@@ -7369,11 +7373,11 @@ class ObjectGenerator:
 
     @staticmethod
     def _mini_is_islabel(t, a):
-        return ObjectGenerator._mini_is_call(t, a, '.ISLABEL', _ISLABEL_ALNUM | {'_'})
+        return ObjectGenerator._mini_is_call(t, a, '.ISLABEL', _WORD_CHARS)
 
     @staticmethod
     def _mini_is_exp(t, a):
-        return ObjectGenerator._mini_is_call(t, a, '.EXP', _SYM_CORE)
+        return ObjectGenerator._mini_is_call(t, a, '.EXP', _WORD_CHARS)
 
     def _captext_has_label(self, txt):
         """綴りがラベル（再配置を持たない `.equ` は除く）か未定義の名前を含むか。caxx.c の captext_has_label()。"""
@@ -7381,7 +7385,7 @@ class ObjectGenerator:
         for w in _captext_words(txt, st.lwordchars):
             le = st.labels.get(w)
             if le is not None:
-                if not (len(le) > 2 and le[2]) or (len(le) > 4 and le[4] is not None):
+                if not le[2] or _lbl_rtype(le) is not None:
                     return True
             elif StringUtils.upper(w) not in st.symbols:
                 return True
@@ -7414,7 +7418,7 @@ class ObjectGenerator:
         nm, e = self._mini_var_arg(t, a, 4, '.exp', name)
         if nm is None:
             return None, e
-        return _mini_bytes(self.state.vars_text.get(nm, '')), e
+        return _mb(self.state.vars_text.get(nm, '')), e
 
     def _mini_symname_at(self, t, a, table):
         """t[a] からの引数が table のシンボル名 1 つだけ（後ろが `,` か終わり）なら (名前, 次の位置)。
@@ -7422,7 +7426,7 @@ class ObjectGenerator:
         caxx.c の mini_symname_at() と同じ規則である。
         """
         k = a
-        while k < len(t) and t[k] in _SYM_CORE:
+        while k < len(t) and t[k] in _WORD_CHARS:
             k += 1
         if k == a:
             return None
@@ -7463,7 +7467,7 @@ class ObjectGenerator:
                 return None, len(t)
             c = t[k]
             if c == '"':
-                return _mini_bytes(''.join(out)), k + 1
+                return _mb(''.join(out)), k + 1
             if c == '\\':
                 e = t[k + 1] if k + 1 < len(t) else chr(0)
                 if e not in _MINI_ESC:
@@ -7670,7 +7674,7 @@ class ObjectGenerator:
         while i < len(s):
             c = s[i]
             if c == '\\' and i + 1 < len(s):
-                parts.append(_TXT_ESCAPES.get(s[i + 1], s[i + 1]))
+                parts.append(StringUtils._STR_ESC.get(s[i + 1], s[i + 1]))
                 i += 2
                 continue
             e = s.find('}}', i + 2) if s.startswith('{{', i) else -1
@@ -7828,7 +7832,7 @@ class ObjectGenerator:
             if t.startswith(delim, i):
                 return ''.join(out) if t[i + len(delim):].strip() == '' else None
             if t[i] == '\\' and i + 1 < len(t):
-                out.append(_TXT_ESCAPES.get(t[i + 1], t[i + 1]))
+                out.append(StringUtils._STR_ESC.get(t[i + 1], t[i + 1]))
                 i += 2
             else:
                 out.append(t[i])
@@ -7883,6 +7887,79 @@ class ObjectGenerator:
         e = self.state.elf
         e.label_refs_seen = [r for r in e.label_refs_seen if r[2] != wi]
 
+    def _obj_text_elem(self, s, qs, objl, txtacc, dispacc, skip):
+        """binary_list の `"..."`（テキストテンプレート）を 1 つ出す。返り値は閉じ `"` の次の位置。"""
+        st = self.state
+        src = s[qs:].split(chr(0), 1)[0]
+        txt = self._txt_render(self._txt_template_inner(src))
+        if not skip(txt == ''):
+            mask = (1 << st.bts) - 1 if st.bts > 0 else 0xFF
+            vals = list(txt.encode('utf-8', errors='surrogateescape'))
+            if (any(v > mask for v in vals) and not st.relax.pass1_size_mode
+                    and st.should_report_errors()):
+                st.diag(f" warning - text template: one or more bytes exceed "
+                        f"the output word width ({st.bts} bit(s)) and were "
+                        f"truncated (high bits discarded): {txt!r}", set_error=False)
+            objl += vals
+            txtacc.append(txt)
+            dispacc.append('"%s"' % asmtext_escaped(txt))
+        closed = False
+        idx = qs + 1
+        while idx < len(s) and s[idx] != chr(0):
+            if s[idx] == '\\' and idx + 1 < len(s):
+                idx += 2
+            elif s[idx] == '"':
+                idx += 1
+                closed = True
+                break
+            else:
+                idx += 1
+        if not closed and not st.relax.pass1_size_mode and st.should_report_errors():
+            st.diag(f" warning - unterminated string literal in pattern "
+                    f"encoding field: {src!r}", set_error=False)
+        return StringUtils.skipspc(s, idx)
+
+    def _obj_call_elem(self, s, idx, objl, txtacc, dispacc, skip):
+        """binary_list の `.call f(...)` を 1 つ出す。返り値は次の位置。"""
+        st = self.state
+        e = st.elf
+        e.current_word_idx = len(objl)
+        words, idx = self.mini_call(s, idx)
+        if skip(len(words) == 1 and words[0] == 0):
+            words = []
+        elif st.textmode and self.call_text is not None and not skip(self.call_text == ''):
+            # `.textmode` では文字列の戻り値をテキストとしても出す（-V と -b の両方）。
+            txtacc.append(self.call_text)
+            dispacc.append('"%s"' % asmtext_escaped(self.call_text))
+        if not words:
+            wi = e.current_word_idx
+            self._drop_refs_at(wi)
+            e.insn_reloc_hint.pop(wi, None)
+            e.insn_reloc_hint.pop(('v', wi), None)
+        objl += words
+        e.current_word_idx = -1
+        return idx
+
+    def _obj_expr_elem(self, s, idx, objl, skip):
+        """binary_list の式を 1 つ評価して出す。返り値は次の位置。"""
+        st = self.state
+        e = st.elf
+        e.current_word_idx = len(objl)
+        if st.relax.pas == 1:
+            st.relax.pass1_size_mode = True
+        el = idx
+        st.expr_missing = False
+        x, idx = self.expr_eval.expression_pat(s, idx)
+        _pat_missing(st, 'binary_list', s[el:idx])
+        if st.relax.pas == 1:
+            st.relax.pass1_size_mode = False
+            st.error_undefined_label = False
+        if skip(x == 0):
+            self._drop_refs_at(e.current_word_idx)
+        else:
+            objl.append(x)
+        return idx
+
     def makeobj(self, s):
         """binary_list を評価してその行のワード列を返す。
 
@@ -7916,69 +7993,19 @@ class ObjectGenerator:
                     if idx < len(s) and s[idx] == ';':
                         drop = True
                         idx += 1
+
+                def skip(is_zero, drop=drop, semicolon=semicolon):
+                    # この要素を出さないか（`;;` は常に、`;` は値が 0 のとき）。
+                    return drop or (semicolon and is_zero)
+
                 qs = StringUtils.skipspc(s, idx)
                 if qs < len(s) and s[qs] == '"':
-                    src = s[qs:].split(chr(0), 1)[0]
-                    txt = self._txt_render(self._txt_template_inner(src))
-                    if not (drop or (semicolon and txt == '')):
-                        mask = (1 << st.bts) - 1 if st.bts > 0 else 0xFF
-                        vals = list(txt.encode('utf-8', errors='surrogateescape'))
-                        if (any(v > mask for v in vals) and not st.relax.pass1_size_mode
-                                and st.should_report_errors()):
-                            st.diag(f" warning - text template: one or more bytes exceed "
-                                    f"the output word width ({st.bts} bit(s)) and were "
-                                    f"truncated (high bits discarded): {txt!r}", set_error=False)
-                        objl += vals
-                        txtacc.append(txt)
-                        dispacc.append('"%s"' % asmtext_escaped(txt))
-                    closed = False
-                    idx = qs + 1
-                    while idx < len(s) and s[idx] != chr(0):
-                        if s[idx] == '\\' and idx + 1 < len(s):
-                            idx += 2
-                        elif s[idx] == '"':
-                            idx += 1
-                            closed = True
-                            break
-                        else:
-                            idx += 1
-                    if not closed and not st.relax.pass1_size_mode and st.should_report_errors():
-                        st.diag(f" warning - unterminated string literal in pattern "
-                                f"encoding field: {src!r}", set_error=False)
-                    idx = StringUtils.skipspc(s, idx)
+                    idx = self._obj_text_elem(s, qs, objl, txtacc, dispacc, skip)
                 elif StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
-                        idx + 5 >= len(s) or s[idx + 5] not in _SYM_CORE):
-                    e.current_word_idx = len(objl)
-                    words, idx = self.mini_call(s, idx)
-                    if drop or (semicolon and len(words) == 1 and words[0] == 0):
-                        words = []
-                    elif (st.textmode and self.call_text is not None
-                          and not (semicolon and self.call_text == '')):
-                        # `.textmode` では文字列の戻り値をテキストとしても出す（-V と -b の両方）。
-                        txtacc.append(self.call_text)
-                        dispacc.append('"%s"' % asmtext_escaped(self.call_text))
-                    if not words:
-                        wi = e.current_word_idx
-                        self._drop_refs_at(wi)
-                        e.insn_reloc_hint.pop(wi, None)
-                        e.insn_reloc_hint.pop(('v', wi), None)
-                    objl += words
-                    e.current_word_idx = -1
+                        idx + 5 >= len(s) or s[idx + 5] not in _WORD_CHARS):
+                    idx = self._obj_call_elem(s, idx, objl, txtacc, dispacc, skip)
                 else:
-                    e.current_word_idx = len(objl)
-                    if st.relax.pas == 1:
-                        st.relax.pass1_size_mode = True
-                    el = idx
-                    st.expr_missing = False
-                    x, idx = self.expr_eval.expression_pat(s, idx)
-                    _pat_missing(st, 'binary_list', s[el:idx])
-                    if st.relax.pas == 1:
-                        st.relax.pass1_size_mode = False
-                        st.error_undefined_label = False
-                    if not drop and (not semicolon or x != 0):
-                        objl.append(x)
-                    else:
-                        self._drop_refs_at(e.current_word_idx)
+                    idx = self._obj_expr_elem(s, idx, objl, skip)
                 if idx < len(s) and s[idx] == ',':
                     idx += 1
                     continue
@@ -8264,7 +8291,11 @@ class VLIWProcessor:
 
 
 class AssemblyDirectiveProcessor:
-    """アセンブリソース側の組み込みディレクティブ（`DB` などはパターンファイルが定義する）。"""
+    """アセンブリソース側の組み込みディレクティブ（`DB` などはパターンファイルが定義する）。
+
+    どのハンドラを呼ぶかは Assembler._ADIR_TABLE が名前で決める。ハンドラは
+    (大文字化する前の名前 l1, 引数 l2) を受け取る。
+    """
 
     def __init__(self, state, expr_eval, binary_writer, label_manager, parser):
         self.state = state
@@ -8275,11 +8306,9 @@ class AssemblyDirectiveProcessor:
 
     def labelc_processing(self, l, ll):
         """`.labelc` — ラベルに使える文字を増やす。"""
-        if l.translate(_AUPPER) != '.LABELC':
-            return False
         if ll:
             self.state.lwordchars = ALPHABET + DIGIT + ll
-        return True
+        return
 
     def label_processing(self, l):
         """行頭の `label:` と `label: .equ 式[::型]` を処理し、残りの行を返す。
@@ -8405,11 +8434,9 @@ class AssemblyDirectiveProcessor:
 
     def export_processing(self, l1, l2):
         """`.export` / `.global` — ラベルを TSV / ELF へ出す指定（`名前::型` で型も付く）。"""
-        if StringUtils.upper(l1) not in (".EXPORT", ".GLOBAL"):
-            return False
         st = self.state
         if not st.should_report_errors():
-            return True
+            return
         idx = 0
         l2 += chr(0)
         while idx < len(l2) and l2[idx] != chr(0):
@@ -8430,12 +8457,12 @@ class AssemblyDirectiveProcessor:
                         ent[4] = rtype
             v = self.label_manager.get_value(s)
             sec = self.label_manager.get_section(s)
-            lentry = st.labels.get(s, [])
-            st.export_labels[s] = [v, sec, len(lentry) > 2 and lentry[2]]
+            lentry = st.labels.get(s)
+            st.export_labels[s] = [v, sec, lentry is not None and lentry[2]]
             idx = StringUtils.skipspc(l2, idx)
             if l2[idx:idx + 1] == ',':
                 idx += 1
-        return True
+        return
 
     def _dir_trailing(self, name, text, idx):
         """指令の引数の後ろに残った文字（空白とタブ以外）をエラーにする。caxx.c の dir_trailing()。"""
@@ -8470,12 +8497,10 @@ class AssemblyDirectiveProcessor:
     def resb_processing(self, l1, l2):
         """`.resb` / `.resw` / `.resd` / `.resq` — バイトを出さず領域だけ予約する。"""
         name = StringUtils.upper(l1)
-        mul = self._RES_UNITS.get(name)
-        if mul is None:
-            return False
+        mul = self._RES_UNITS[name]
         x = self._int_arg(name, l2)
         if x is None:
-            return True
+            return
         if x < 0:
             self.state.diag(f" error - {name} requires a non-negative count, got {x}.", set_error=True)
         elif x > (1 << 28) // mul:
@@ -8483,35 +8508,29 @@ class AssemblyDirectiveProcessor:
                             f"{1 << 28} words.", set_error=True)
         else:
             self.state.pc += x * mul
-        return True
+        return
 
     def zero_processing(self, l1, l2):
         """`.zero` — ゼロバイトを並べる。"""
-        if StringUtils.upper(l1) != ".ZERO":
-            return False
         x = self._int_arg(".ZERO", l2)
         if x is None:
-            return True
+            return
         if x < 0:
             self.state.diag(f" error - .ZERO requires a non-negative count, got {x}.", set_error=True)
         elif x > 1 << 28:
             self.state.diag(f" error - .ZERO count {x} exceeds maximum {1 << 28}.", set_error=True)
         else:
             for _ in range(x):
-                self.binary_writer.outbin2(self.state.pc, 0x00)
+                self.binary_writer.outbin(self.state.pc, 0x00, listing=False)
                 self.state.pc += 1
-        return True
+        return
 
     def ascii_processing(self, l1, l2):
         """`.ascii` — 文字列のバイト列を出す。"""
-        if StringUtils.upper(l1) != ".ASCII":
-            return False
         return self.asciistr(l2)
 
     def asciiz_processing(self, l1, l2):
         """`.asciz` — 文字列のバイト列と末尾の 0 を出す。"""
-        if StringUtils.upper(l1) != ".ASCIZ":
-            return False
         if not self.asciistr(l2):
             self.state.diag(" error - .ASCIZ requires a quoted string.", set_error=True)
             return False
@@ -8526,16 +8545,14 @@ class AssemblyDirectiveProcessor:
     _DATA_VAR = '\x01data'
 
     def data_processing(self, l1, l2):
-        """`.db` 〜 `.dz` — 式の値をワード列にする（ディレクティブでなければ None）。caxx.c の adir_data()。
+        """`.db` 〜 `.dz` — 式の値をワード列にする。caxx.c の adir_data()。
 
         1 つの値は 1〜64 ワードで `.bits` のバイト順に並ぶ。`.db` だけは `"..."` も書ける。
         ワード列は binary_list と同じ経路で書くので -o では同じ規則でリロケーションが付く
         （`.vliw` の中では直接書く）。誤りの値も 0 のワードを出し、行の大きさを保つ。
         """
         name = StringUtils.upper(l1)
-        n = self._DATA_UNITS.get(name)
-        if n is None:
-            return None
+        n = self._DATA_UNITS[name]
         st = self.state
         st._data_dir_line = True
         bts = st.bts
@@ -8662,18 +8679,16 @@ class AssemblyDirectiveProcessor:
 
         名前は 1 語。後ろの `,"aw"` などはエラーにする（caxx.c の adir_section()）。
         """
-        if StringUtils.upper(l1) not in (".SECTION", ".SEGMENT"):
-            return False
         st = self.state
         e = 0
         while e < len(l2) and l2[e] not in ' \t,':
             e += 1
         if e < len(l2) and self._dir_trailing(".SECTION", l2, e):
-            return True
+            return
         if l2 == '':
-            return True
+            return
         old = st.sections.setdefault(st.current_section, [0, 0, 0, False])
-        entry_pc = old[2] if len(old) > 2 else old[0]
+        entry_pc = old[2]
         tentative = st.pc - entry_pc
         if tentative > 0:
             old[1] += tentative
@@ -8683,51 +8698,44 @@ class AssemblyDirectiveProcessor:
         if cur is None:
             st.sections[l2] = [st.pc, 0, st.pc, False]
         else:
-            confirmed = len(cur) > 3 and cur[3]
-            start = st.pc if cur[1] == 0 and not confirmed else min(cur[0], st.pc)
+            start = st.pc if cur[1] == 0 and not cur[3] else min(cur[0], st.pc)
             st.sections[l2] = [start, cur[1], st.pc, False]
-        return True
+        return
 
     def align_processing(self, l1, l2):
         """`.align` — 整列する（引数なしなら前回か既定の値）。"""
-        if StringUtils.upper(l1) != ".ALIGN":
-            return False
         st = self.state
         if l2 != '':
             u = self._int_arg(".ALIGN", l2)
             if u is None:
-                return True
+                return
             if u <= 0:
                 st.diag(f" error - .ALIGN requires a positive value, got {u}.", set_error=True)
-                return True
+                return
             st.align = u
         rel = (self.label_manager._section_relative_offset(st.current_section, st.pc)
                if _sectioned(st) else None)
         base = rel if rel is not None else st.pc
         st.pc += self.binary_writer.align_(base) - base
-        return True
+        return
 
     def endsection_processing(self, l1, l2):
         """`.endsection` / `.endsegment` — セクションを閉じる。"""
-        if StringUtils.upper(l1) not in (".ENDSECTION", ".ENDSEGMENT"):
-            return False
         st = self.state
         cs = st.current_section
         if cs not in st.sections:
             st.diag(f" error - .ENDSECTION without matching .SECTION for '{cs}'.", set_error=True)
-            return True
-        entry = st.sections[cs]
-        start = entry[0]
-        entry_pc = entry[2] if len(entry) > 2 else start
+            return
+        start, _size, entry_pc, _closed = st.sections[cs]
         block = st.pc - entry_pc
         if block < 0:
             st.diag(f" warning - ENDSECTION: computed block size {block} < 0 for "
                     f"'{cs}'; keeping previous size.", set_error=False)
-            return True
+            return
         if block > 0:
             st.section_ranges.append((cs, entry_pc, block))
-        st.sections[cs] = [start, entry[1] + block, st.pc, True]
-        return True
+        st.sections[cs] = [start, _size + block, st.pc, True]
+        return
 
     @staticmethod
     def _type_suffix(l2, idx):
@@ -8747,8 +8755,6 @@ class AssemblyDirectiveProcessor:
 
     def extern_processing(self, l1, l2):
         """`.extern 名前[::型], ...` — シンボルを外部と結び付ける。"""
-        if StringUtils.upper(l1) != ".EXTERN":
-            return False
         st = self.state
         idx = 0
         l2 = l2 + chr(0)
@@ -8775,7 +8781,7 @@ class AssemblyDirectiveProcessor:
                 st.extern_untyped.add(name)
             if existing is None:
                 st.labels[name] = [0, '.text', False, True, reloc_type]
-            elif len(existing) > 3 and existing[3]:
+            elif existing[3]:
                 if len(existing) >= 5 and explicit:
                     existing[4] = reloc_type
             else:
@@ -8784,7 +8790,7 @@ class AssemblyDirectiveProcessor:
             idx = StringUtils.skipspc(l2, idx)
             if l2[idx:idx + 1] == ',':
                 idx += 1
-        return True
+        return
 
     def _sym_decl_scan(self, l2, nfields):
         """シンボル属性ディレクティブの `名前[::欄...], ...` を [(名前, 欄のリスト)] に切り出す。"""
@@ -8873,18 +8879,16 @@ class AssemblyDirectiveProcessor:
 
         記録はパス2で -o のときだけ。`.eh_frame` は write_elf_obj() が組む。caxx.c の dir_cfi()。
         """
-        if not StringUtils.upper(l1).startswith('.CFI_'):
-            return False
         st = self.state
         if not (st.should_report_errors() and st.elf.objfile):
-            return True
+            return
         op = l1[5:].translate(_ALOWER)
         spec = _CFI_OPS.get(op)
         if spec is None:
             st.diag(f" error - unknown CFI directive '{l1}'.", set_error=True)
-            return True
+            return
         if op == 'sections':
-            return True
+            return
         e = st.elf
         args = [a.strip() for a in l2.split(',')] if l2.strip() else []
         sec = st.current_section
@@ -8900,21 +8904,21 @@ class AssemblyDirectiveProcessor:
             else:
                 e.cfi_cur = {'sec': sec, 'start': off, 'end': off, 'simple': bool(args),
                              'ops': [], 'ra': None, 'signal': False, 'pers': None, 'lsda': None}
-            return True
+            return
         cur = e.cfi_cur
         if cur is None:
             st.diag(f" error - .cfi_{op}: not inside .cfi_startproc.", set_error=True)
-            return True
+            return
         if sec != cur['sec']:
             st.diag(f" error - .cfi_{op}: the section changed inside the function.", set_error=True)
-            return True
+            return
         if spec == '*':
             if not args:
                 st.diag(f" error - .cfi_{op}: at least one argument is required.", set_error=True)
-                return True
+                return
         elif len(args) != len(spec):
             st.diag(f" error - .cfi_{op}: {len(spec)} argument(s) expected.", set_error=True)
-            return True
+            return
         vals = []
         for k, a in enumerate(args):
             kind = '*' if spec == '*' else spec[k]
@@ -8928,7 +8932,7 @@ class AssemblyDirectiveProcessor:
                     st.diag(f" error - .cfi_{op}: '{a}' is not a byte.", set_error=True)
                     v = None
             if v is None:
-                return True
+                return
             vals.append(v)
         if op == 'endproc':
             cur['end'] = off
@@ -8941,17 +8945,15 @@ class AssemblyDirectiveProcessor:
         elif op in ('personality', 'lsda'):
             if not 0 <= vals[0] <= 255:
                 st.diag(f" error - .cfi_{op}: '{args[0]}' is not an encoding byte.", set_error=True)
-                return True
+                return
             cur['pers' if op == 'personality' else 'lsda'] = \
                 None if vals[0] == 0xff else (vals[0], vals[1])
         else:
             cur['ops'].append((off, op, tuple(vals)))
-        return True
+        return
 
     def type_processing(self, l1, l2):
         """`.type` — ELF シンボルの種別（STT_*、名前か 0..15）。"""
-        if StringUtils.upper(l1) != ".TYPE":
-            return False
         if self.state.should_report_errors():
             for name, f in self._sym_decl_scan(l2, 1):
                 kind = f[0].translate(_ALOWER)
@@ -8964,12 +8966,10 @@ class AssemblyDirectiveProcessor:
                     v = self._sym_decl_num('.TYPE', name, kind, 0, 15)
                 if v is not None:
                     _sym_attr_slot(self.state, name)[_SA_TYPE] = v
-        return True
+        return
 
     def size_processing(self, l1, l2):
         """`.size` — シンボルの大きさ（ワード数。出力時に幅をかける）。"""
-        if StringUtils.upper(l1) != ".SIZE":
-            return False
         if self.state.should_report_errors():
             for name, f in self._sym_decl_scan(l2, 1):
                 v = self._sym_decl_num('.SIZE', name, f[0], 0, 0x7FFFFFFFFFFFFFFF)
@@ -8977,12 +8977,10 @@ class AssemblyDirectiveProcessor:
                     a = _sym_attr_slot(self.state, name)
                     a[_SA_SIZE_SET] = 1
                     a[_SA_SIZE] = v
-        return True
+        return
 
     def weak_processing(self, l1, l2):
         """`.weak` — 弱シンボル（STB_WEAK）にする。"""
-        if StringUtils.upper(l1) != ".WEAK":
-            return False
         st = self.state
         record = st.should_report_errors()
         for name, _f in self._sym_decl_scan(l2, 0):
@@ -8990,41 +8988,34 @@ class AssemblyDirectiveProcessor:
             if not record:
                 continue
             _sym_attr_slot(st, name)[_SA_WEAK] = 1
-            lentry = st.labels.get(name, [])
-            if not (len(lentry) > 3 and lentry[3]):
+            lentry = st.labels[name]
+            if not lentry[3]:
                 st.export_labels[name] = [self.label_manager.get_value(name),
-                                          self.label_manager.get_section(name),
-                                          len(lentry) > 2 and lentry[2]]
-        return True
+                                          self.label_manager.get_section(name), lentry[2]]
+        return
 
     _VIS_DIRS = {'.HIDDEN': 2, '.PROTECTED': 3, '.INTERNAL': 1}
 
     def visibility_processing(self, l1, l2):
         """`.hidden` / `.protected` / `.internal` — 可視性を書く。"""
-        vis = self._VIS_DIRS.get(StringUtils.upper(l1))
-        if vis is None:
-            return False
+        vis = self._VIS_DIRS[StringUtils.upper(l1)]
         if self.state.should_report_errors():
             for name, _f in self._sym_decl_scan(l2, 0):
                 a = _sym_attr_slot(self.state, name)
                 a[_SA_OTHER] = (a[_SA_OTHER] & ~0x03) | vis
-        return True
+        return
 
     def other_processing(self, l1, l2):
         """`.other` — st_other バイトを丸ごと置き換える。"""
-        if StringUtils.upper(l1) != ".OTHER":
-            return False
         if self.state.should_report_errors():
             for name, f in self._sym_decl_scan(l2, 1):
                 v = self._sym_decl_num('.OTHER', name, f[0], 0, 255)
                 if v is not None:
                     _sym_attr_slot(self.state, name)[_SA_OTHER] = v
-        return True
+        return
 
     def comm_processing(self, l1, l2):
         """`.comm 名前::大きさ[::整列]` — 共通シンボル（SHN_COMMON）にする。"""
-        if StringUtils.upper(l1) != ".COMM":
-            return False
         st = self.state
         record = st.should_report_errors()
         for name, f in self._sym_decl_scan(l2, 2):
@@ -9049,18 +9040,16 @@ class AssemblyDirectiveProcessor:
             a[_SA_ALIGN] = al
             if a[_SA_TYPE] == 0:
                 a[_SA_TYPE] = 1
-        return True
+        return
 
     def reloctype_processing(self, l1, l2):
         """`.reloctype 8bit,16bit,32bit,64bit` — このソースでの幅推測の型を上書きする。"""
-        if StringUtils.upper(l1) != ".RELOCTYPE":
-            return False
         st = self.state
         mach = elf_machine_table(st)
         if not mach['named']:
             st.diag(f" warning - .RELOCTYPE: no relocation type is known for "
                     f"machine {st.elf.machine}; declare them with .elftype", set_error=False)
-            return True
+            return
         for i, raw in enumerate(l2.split(',') if l2 else []):
             if i >= 4:
                 st.diag(" warning - .RELOCTYPE: too many arguments (only "
@@ -9082,46 +9071,44 @@ class AssemblyDirectiveProcessor:
                         f"in the {want * 8}-bit position; ignored", set_error=False)
                 continue
             st.elf.reloctype_override[want] = rtype
-        return True
+        return
 
     def org_processing(self, l1, l2):
         """`.org 番地[,p]` — ロケーションカウンタを設定する（`,p` は隙間を `.padding` で埋める）。
 
         -o / -E では後ろへ戻せない（GNU as と同じ。caxx.c の adir_org()）。
         """
-        if StringUtils.upper(l1) != ".ORG":
-            return False
         st = self.state
         st.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
         fill = l2[idx:idx + 2].translate(_AUPPER) == ',P'
         if self._dir_trailing(".ORG", l2, idx + 2 if fill else idx):
-            return True
+            return
         if st.error_undefined_label or _undef(u):
             st.diag(" error - .ORG argument contains undefined label.", set_error=True)
-            return True
+            return
         try:
             u = int(u)
         except (OverflowError, ValueError):
             st.diag(" error - .ORG argument is non-finite or invalid.", set_error=True)
-            return True
+            return
         if u < 0:
             st.diag(f" error - .ORG address must be non-negative, got {u}.", set_error=True)
-            return True
+            return
         if (st.elf.objfile or st.expfile_elf) and u < st.pc:
             st.diag(f" error - .ORG moves the location counter backwards (from "
                     f"{st.pc} to {u}); an ELF object (-o, -E) cannot "
                     f"hold that.", set_error=True)
-            return True
+            return
         if fill and u > st.pc:
             count = u - st.pc
             if count > 1 << 28:
                 st.diag(f" error - .ORG ,P fill count {count} exceeds maximum {1 << 28}.", set_error=True)
-                return True
+                return
             for i in range(count):
-                self.binary_writer.outbin2(i + st.pc, st.padding)
+                self.binary_writer.outbin(i + st.pc, st.padding, listing=False)
         st.pc = u
-        return True
+        return
 
 
 # マクロ層で落とす空白はスペースとタブだけ（caxx.c の m_ 系の関数と同じ。引数なしの strip() は使わない）。
@@ -9708,43 +9695,6 @@ def _echo_items_cached(text):
             _ECHO_CACHE.clear()
         _ECHO_CACHE[text] = ent
     return ent
-
-
-# マクロ層の文字列はミニ言語と同じく UTF-8 のバイトの並び（長さ・添字・大文字化・比較・
-# 1 文字の文字定数はバイトで決める。caxx.c は C 文字列をそのまま持つ）。
-def _mb(s):
-    """マクロ層の文字列を UTF-8 のバイト列にする。"""
-    return s.encode('utf-8', 'surrogateescape')
-
-
-def _mt(b):
-    """バイト列を文字列に戻す（切れた UTF-8 は surrogateescape の文字になる）。"""
-    return b.decode('utf-8', 'surrogateescape')
-
-
-def _mnorm(s):
-    """連結などで割れた UTF-8 をつなぎ直す。"""
-    return _mt(_mb(s))
-
-
-def _ad(c):
-    """ASCII の数字か（str.isdigit() は全角数字なども数字とみなす）。"""
-    return '0' <= c <= '9'
-
-
-def _aa(c):
-    """ASCII の英字か。"""
-    return ('a' <= c <= 'z') or ('A' <= c <= 'Z')
-
-
-def _aan(c):
-    """ASCII の英数字か（caxx.c の isalnum() と同じ範囲）。"""
-    return _ad(c) or _aa(c)
-
-
-def _alow(s):
-    """ASCII だけを小文字にする（caxx.c の strcasecmp() と同じ範囲）。"""
-    return s.translate(_ALOWER)
 
 
 def _cmp_eq(a, b):
@@ -10598,6 +10548,470 @@ _BUILTINS = {
 }
 
 
+class _LineRelocs:
+    """1 行のワード列 objl に、照合中に見えたラベル参照からリロケーションを付ける（-o のパス2）。
+
+    参照を（ラベル, 位置）で束ね、ラベル差（`('d', 位置)` のヒント）→ `.reloc` の型の欄 →
+    `.reloctype` と幅の推測 の順に型を決めて state.elf.relocations に積む。RELA では欄を 0 にする。
+    caxx.c の lineassemble() の同じ部分と同じ規則である。Assembler._line_relocations() が行ごとに作る。
+    """
+
+    def __init__(self, asm, objl):
+        st = asm.state
+        self.asm = asm
+        self.st = st
+        self.objl = objl
+        self.bpw = max(1, (st.bts + 7) // 8)
+        self.sec = st.current_section
+        self.completed_words = 0
+        self.entry_pc = 0
+        if self.sec in st.sections:
+            self.completed_words, self.entry_pc = st.sections[self.sec][1:3]
+        self.mach = elf_machine_table(st)
+        self.rmap = {**self.mach['width_guess'], **st.elf.reloctype_override}
+        self.pc_rel = self.mach['pc_rel']
+        # 加数の単位（byte ならワードのバイト数を掛ける）。
+        self.scale = 1 if self.mach['unit'] == 'word' else self.bpw
+        self.bts = st.bts
+        self.wm = (1 << self.bts) - 1
+        self.little = st.endian == 'little'
+
+    def run(self):
+        """参照を束ねて 1 群ずつ処理する。"""
+        st = self.st
+        valid_refs = sorted((r for r in st.elf.label_refs_seen if r[2] >= 0),
+                            key=lambda r: r[2])
+        # 同じ（ラベル, ワード位置）は最初の 1 つだけ。
+        _seen = set()
+        valid_refs = [r for r in valid_refs
+                      if (r[0], r[2]) not in _seen and not _seen.add((r[0], r[2]))]
+
+        _widx_labels = {}
+        for _ln, _, _wi in valid_refs:
+            _widx_labels.setdefault(_wi, set()).add(_ln)
+        _ambiguous = {_wi for _wi, ns in _widx_labels.items() if len(ns) > 1}
+        valid_refs = [r for r in valid_refs if r[2] not in _ambiguous]
+
+        groups = []
+        gi = 0
+        while gi < len(valid_refs):
+            lname, abs_w, widx = valid_refs[gi]
+            gj = gi + 1
+            while (gj < len(valid_refs) and valid_refs[gj][0] == lname
+                   and valid_refs[gj][2] == widx + (gj - gi)
+                   and valid_refs[gj][2] not in st._elf_field_breaks):
+                gj += 1
+            groups.append((lname, abs_w, widx, gj - gi))
+            gi = gj
+        for lname, abs_w, first_widx, num_words in groups:
+            self._group(lname, abs_w, first_widx, num_words)
+
+    # -- 欄の読み書き --
+    def _wsh(self, k, nw):
+        """欄の k 番目のワードの、欄の値の中でのシフト量（バイト順に従う）。"""
+        return self.bts * k if self.little else self.bts * (nw - 1 - k)
+
+    def _field_raw(self, first, nwords):
+        """欄のワード列を 1 つの整数に読み、符号を付ける。"""
+        objl = self.objl
+        rv = 0
+        for k in range(nwords):
+            if first + k < len(objl):
+                rv |= (int(objl[first + k]) & self.wm) << self._wsh(k, nwords)
+        fb = nwords * self.bts
+        if fb > 0 and rv >= (1 << (fb - 1)):
+            rv -= (1 << fb)
+        return rv
+
+    def _zero(self, first, nwords):
+        """RELA では加数を項目が持つので欄は 0 で出す（GNU as と llvm-mc の形）。"""
+        objl = self.objl
+        for k in range(nwords):
+            if first + k < len(objl):
+                objl[first + k] = 0
+
+    def _clear_mask(self, w, nw, mask):
+        """命令欄のマスクのビットだけを消す。"""
+        objl = self.objl
+        for k in range(nw):
+            objl[w + k] = int(objl[w + k]) & ~((mask >> self._wsh(k, nw)) & self.wm) & self.wm
+
+    def _sec_off(self, w):
+        """出力ワード w のセクションの中のバイト位置。"""
+        return (self.completed_words + (self.st.pc + w - self.entry_pc)) * self.bpw
+
+    def _word_off(self, w):
+        """出力ワード w のセクションの中のワード位置。"""
+        return self.completed_words + (self.st.pc + w - self.entry_pc)
+
+    def _put(self, off, sym, rtype, addend, nbytes, fmask=0):
+        """リロケーションを 1 つ積む。"""
+        self.st.elf.relocations.append((self.sec, off, sym, rtype, addend, nbytes, fmask))
+
+    # -- ラベルの性質 --
+    def _local_here(self, nm):
+        """同じセクションの局所ラベル（外部・.equ・.global・.weak でない）か。"""
+        st = self.st
+        le = st.labels.get(nm)
+        return (le is not None and not le[3] and not le[2] and le[1] and le[1] == self.sec
+                and nm not in st.export_labels
+                and not _sym_attr(st, nm)[_SA_WEAK])
+
+    def _src_type(self, le, nm, nbytes):
+        """ラベルに付いた型（幅が合うときだけ。型を書かない .extern は除く）。"""
+        src = _lbl_rtype(le) if le else None
+        if src is not None and nm not in self.st.extern_untyped:
+            ex = self.mach['reloc_bytes'].get(src)
+            if ex is None or ex == nbytes:
+                return src
+        return None
+
+    def _no_pcrel_type(self, num_bytes, lname):
+        """PC 相対の型が無いときの -d の知らせ。"""
+        if self.st.debug:
+            self.st.diag(
+                f" warning - no PC-relative relocation type for a "
+                f"{num_bytes}-byte reference to '{lname}'; relocation "
+                f"omitted.", set_error=False)
+
+    # -- 1 群の処理 --
+    def _group(self, lname, abs_w, first_widx, num_words):
+        st = self.st
+        num_bytes = num_words * self.bpw
+        _dinfo = st.elf.insn_reloc_hint.get(('d', first_widx))
+        if _dinfo is not None:
+            self._diff(_dinfo, abs_w, first_widx, num_words, num_bytes)
+            return
+
+        _hint = st.elf.insn_reloc_hint.get(first_widx)
+        lentry = st.labels.get(lname)
+        _src_rtype = _lbl_rtype(lentry) if lentry else None
+        _forced_rtype = None
+        if _hint is not None:
+            _hint_rtype, _hint_addend, _hint_fmask, _hint_pair = _hint
+            if _src_rtype is not None and lname not in st.extern_untyped:
+                _hint_rtype = _src_rtype
+            _fdecl = insn_reloc_field_decl(st, _hint_rtype)
+            # `.reloc` の第 4 欄があれば、その行の欄のマスクはそれ。
+            if _fdecl is not None and _hint_fmask:
+                _fdecl = (_hint_fmask,) + tuple(_fdecl[1:])
+            if _fdecl is None:
+                _forced_rtype = _hint_rtype
+            else:
+                self._field(lname, first_widx, _hint_rtype, _hint_addend, _hint_fmask,
+                            _hint_pair, _fdecl)
+                return
+        self._guess(lname, abs_w, first_widx, num_words, num_bytes, _forced_rtype, _src_rtype)
+
+    def _diff(self, dinfo, abs_w, first_widx, num_words, num_bytes):
+        """ラベル差（ラベルの 1 次結合）。足す項には足す型、引く項には引く型を同じ位置に。
+
+        定数部は最初の足す項（無ければ最初の引く項に符号を反転して）の加数。
+        """
+        st = self.st
+        mach = self.mach
+        objl = self.objl
+        bpw = self.bpw
+        if first_widx >= len(objl):
+            return
+        _dterms, _drt, _dcst, _dfmask = dinfo
+        if _drt is None and len(_dterms) == 2:
+            # 「ラベル − `$$`」（`.elfpcguess::1`）。同じセクションのラベルなら欄の値のまま、
+            # 違えばその幅の PC 相対の型で加数は定数部（caxx.c の lineassemble() と同じ）。
+            _pl = next((n for sg, n in _dterms if sg > 0), None)
+            if _pl is not None and any(sg < 0 and n == '$$' for sg, n in _dterms):
+                _ple = st.labels.get(_pl)
+                _same = (_ple is not None and not _ple[3] and _ple[1] == self.sec)
+                if not _same:
+                    _prt = self._src_type(_ple, _pl, num_bytes)
+                    # その幅の `.elfdiff` があれば対にし、引く項はこの欄のアンカー
+                    # （llvm-mc が RISC-V の `.quad ext-.` に付ける形）。
+                    _ppair = (mach['diff'].get(num_bytes) if _prt is None else None)
+                    if _prt is None and _ppair is None:
+                        _prt = _reloc_data_pcrel(mach, num_bytes)
+                    if _prt is None and _ppair is None:
+                        self._no_pcrel_type(num_bytes, _pl)
+                    else:
+                        if mach['is_rela']:
+                            self._zero(first_widx, num_words)
+                        _psec = self._sec_off(first_widx)
+                        self._put(_psec, _pl, _ppair[0] if _ppair is not None else _prt,
+                                  _dcst * self.scale, num_bytes)
+                        if _ppair is not None:
+                            _anc = _elf_anchor_at(st, self.sec, _psec)
+                            self._put(_psec, _anc, _ppair[1], 0, num_bytes)
+                return
+        _dexpr = ''.join(('+' if sg > 0 else '-') + n for sg, n in _dterms)
+        _dexpr = _dexpr[1:] if _dexpr.startswith('+') else _dexpr
+        # 緩和しない機種で、全ラベルが 1 つのセクションにあり足す項と引く項の数が同じ差は
+        # 定数（欄の値のまま。caxx.c の lineassemble() と同じ）。
+        if not _elf_relaxing(st):
+            _dsecs = set()
+            _dok = True
+            for _sg, _n in _dterms:
+                _dle = st.labels.get(_n)
+                if _dle is None or _dle[3] or not _dle[1]:
+                    _dok = False
+                    break
+                _dsecs.add(_dle[1])
+            if _dok and len(_dsecs) == 1 and sum(sg for sg, _n in _dterms) == 0:
+                return
+        # `.elfpcguess::1` でその幅の `.elfdiff` が無いとき、「ラベル − いまのセクションの
+        # ラベル」はその位置からの PC 相対（GNU as と llvm-mc の形）。加数は定数部に
+        # 「欄の位置 − 引くラベルの位置」を足したもの（caxx.c の lineassemble() と同じ）。
+        if (_drt is None and len(_dterms) == 2 and mach['pcrel_guess']):
+            _pl = next((n for sg, n in _dterms if sg > 0), None)
+            _pm = next((n for sg, n in _dterms if sg < 0), None)
+            _mle = st.labels.get(_pm) if _pm is not None else None
+            _mw = None
+            if (_pl is not None and _mle is not None
+                    and not _mle[3] and _mle[1]
+                    and _mle[1] == self.sec
+                    and mach['diff'].get(num_bytes) is None):
+                _mw = self.asm.label_manager._section_relative_offset(self.sec, int(_mle[0]))
+            if _mw is not None:
+                _prt = self._src_type(st.labels.get(_pl), _pl, num_bytes)
+                if _prt is None:
+                    _prt = _reloc_data_pcrel(mach, num_bytes)
+                if _prt is None:
+                    self._no_pcrel_type(num_bytes, _pl)
+                else:
+                    _pwo = self._word_off(first_widx)
+                    if mach['is_rela']:
+                        self._zero(first_widx, num_words)
+                    self._put(_pwo * bpw, _pl, _prt, (_dcst + (_pwo - _mw)) * self.scale, num_bytes)
+                return
+        _dfd = None
+        if _drt is not None:
+            _dpair = mach['diff_t'].get(_drt)
+            _dfd = mach['field'].get(_drt)
+            if _dfd is not None and _dfmask:
+                _dfd = (_dfmask,) + tuple(_dfd[1:])
+        else:
+            _dpair = mach['diff'].get(num_bytes)
+        if _dpair is None:
+            if st.debug:
+                st.diag(f" warning - no .elfdiff pair for the difference "
+                        f"'{_dexpr}'; relocation omitted.", set_error=False)
+            return
+        if _drt is not None:
+            # 型付きの差: 欄は `.elffield` があればその位置と幅、無ければこの参照のワード列。
+            _dconst = _dcst * self.scale
+            _dw = first_widx + (_dfd[1] // bpw if _dfd is not None else 0)
+            _dnb = (mach['reloc_bytes'].get(_drt, 0) or num_bytes) \
+                if _dfd is not None else num_bytes
+            if _dfd is not None and mach['is_rela']:
+                _nw = max(1, _dnb // bpw)
+                if _dw + _nw <= len(objl):
+                    self._clear_mask(_dw, _nw, _dfd[0])
+        else:
+            _dconst = (self._field_raw(first_widx, num_words) - int(abs_w)) * self.scale
+            _dw = first_widx
+            _dnb = num_bytes
+            if mach['is_rela']:
+                self._zero(first_widx, num_words)
+        _dsec = self._sec_off(_dw)
+        # 足す項を先に（SET 型のように欄を上書きする足す型が先に効くように）。
+        _dput = False
+        _has_plus = any(sg > 0 for sg, _n in _dterms)
+        _dord = [t for t in _dterms if t[0] > 0] + [t for t in _dterms if t[0] < 0]
+        for sg, n in _dord:
+            _da = 0
+            if not _dput and (sg > 0 or not _has_plus):
+                _da = _dconst if sg > 0 else -_dconst
+                _dput = True
+            self._put(_dsec, n, _dpair[0] if sg > 0 else _dpair[1], _da, _dnb,
+                      _dfmask if _dfd is not None else 0)
+
+    def _field(self, lname, first_widx, rtype, addend, fmask, pair, fdecl):
+        """`.reloc` で型が決まり `.elffield` の欄を持つ参照。"""
+        st = self.st
+        mach = self.mach
+        objl = self.objl
+        bpw = self.bpw
+        _fmask, _foff, _fsh, _fbias = fdecl
+        _insn_bytes = mach['reloc_bytes'].get(rtype, 4)
+        _insn_words = max(1, _insn_bytes // bpw)
+        _fw = first_widx + _foff // bpw
+        # `.elfresolve`: 同じセクションの局所ラベルへの PC 相対の欄は、リンカが書く値
+        # （ラベル + 加数 + 補正 − 位置）をシフトしてマスクへ詰め、リロケーションは
+        # 出さない（収まらなければエラー。caxx.c の lineassemble() と同じ）。
+        if (mach.get('resolve') and not _elf_relaxing(st)
+                and rtype in mach['resolve']
+                and _fw + _insn_words <= len(objl)):
+            _lw = None
+            if self._local_here(lname):
+                _rle = st.labels[lname]
+                _lw = self.asm.label_manager._section_relative_offset(self.sec, int(_rle[0]))
+                # `.section` の無いソースでは範囲の記録が無いので番地のまま。
+                if _lw is None:
+                    _lw = int(_rle[0])
+            if _lw is not None:
+                _pw = self._word_off(_fw)
+                _val = (_lw - _pw) * self.scale + addend * self.scale + _fbias
+                _sv = _val >> _fsh
+                _nb = bin(_fmask).count('1')
+                _fits = _nb >= 64 or (-(1 << (_nb - 1)) <= _sv < (1 << (_nb - 1)))
+                if 0 < _fsh < 63 and (_val & ((1 << _fsh) - 1)) != 0:
+                    _fits = False
+                if not _fits and st.should_report_errors():
+                    st.diag(
+                        f" error - the reference to '{lname}' resolved in its "
+                        f"section does not fit the field.  "
+                        f"[{st.current_file}:{st.ln}]",
+                        set_error=True)
+                _iv = 0
+                for _k in range(_insn_words):
+                    _iv |= (int(objl[_fw + _k]) & self.wm) << self._wsh(_k, _insn_words)
+                # ビットが並び替わる型（AArch64 の adr、RISC-V の B / J）は `.elfencode`。
+                _renc = mach['encode'].get(rtype)
+                if _renc is not None:
+                    _rnv = self.asm._elf_call_func('.elfencode', _renc, [_iv, _val])
+                    if _rnv is not None:
+                        _iv = int(_rnv)
+                else:
+                    _iv = (_iv & ~_fmask) | _field_deposit(_fmask, _sv)
+                for _k in range(_insn_words):
+                    objl[_fw + _k] = (_iv >> self._wsh(_k, _insn_words)) & self.wm
+                return
+        if _fw + _insn_words <= len(objl):
+            self._clear_mask(_fw, _insn_words, _fmask)
+        _sec_rel_h = self._sec_off(_fw)
+        # 加数は「オペランドの値 − ラベルの値」に補正を足したもの。
+        self._put(_sec_rel_h, lname, rtype, addend * self.scale + _fbias, _insn_bytes, fmask)
+        # `.reloc` の追加の再配置（同じシンボルと加数。`.elfanchor` の型はこの位置の
+        # アンカーを指し、加数は補正だけ）。
+        for _prt_p, _poff_p in (pair or ()):
+            _pfd = insn_reloc_field_decl(st, _prt_p)
+            if _pfd is None:
+                continue
+            _pbytes = mach['reloc_bytes'].get(_prt_p, 0) or 4
+            _pwords = max(1, _pbytes // bpw)
+            _pw = first_widx + _poff_p // bpw
+            if _pw + _pwords > len(objl):
+                continue
+            if mach['is_rela']:
+                self._clear_mask(_pw, _pwords, _pfd[0])
+            _panc = _prt_p in mach.get('anchor', ())
+            _psym = (_elf_anchor_at(st, self.sec, _sec_rel_h) if _panc else lname)
+            self._put(self._sec_off(_pw), _psym, _prt_p,
+                      (0 if _panc else addend * self.scale) + _pfd[3], _pbytes)
+
+    def _guess(self, lname, abs_w, first_widx, num_words, num_bytes, forced_rtype, src_rtype):
+        """型を `.reloctype` / ラベルの型 / 幅の推測で決める普通の参照。"""
+        st = self.st
+        mach = self.mach
+        objl = self.objl
+        rtype = 0
+        _rtype_is_default_guess = False
+        # `.reloctype` はその幅の推測の型（型を書かない `.extern` の既定の型も）を上書きし、
+        # 上書きした型は絶対／PC 相対の選び直しにかけない（caxx.c と同じ）。
+        _rt_src_ovr = st.elf.reloctype_override.get(num_bytes)
+        if forced_rtype is not None:
+            rtype = forced_rtype
+        elif (src_rtype is not None
+              and not (_rt_src_ovr is not None and lname in st.extern_untyped)):
+            expected = mach['reloc_bytes'].get(src_rtype)
+            if expected is None or expected == num_bytes:
+                rtype = src_rtype
+            else:
+                rtype = self.rmap.get(num_bytes, 0)
+                _rtype_is_default_guess = _rt_src_ovr is None
+        else:
+            rtype = self.rmap.get(num_bytes, 0)
+            _rtype_is_default_guess = _rt_src_ovr is None
+        # `.db` などの欄は式の値そのものなので、推測の型は同じ幅の絶対型にする（x86-64 の
+        # 4 バイトの推測は rel32 向けの PC 相対のため）。caxx.c の lineassemble() と同じ。
+        if (first_widx in st._elf_data_fields
+                and forced_rtype is None and _rt_src_ovr is None
+                and (src_rtype is None or lname in st.extern_untyped)):
+            _dabs = _reloc_same_width(mach, num_bytes, False)
+            if _dabs is not None:
+                rtype = _dabs
+                _rtype_is_default_guess = False
+
+        if first_widx >= len(objl):
+            return
+        if rtype == 0:
+            # `.db` などの行では -d が無くても知らせる（caxx.c と同じ）。
+            if st.debug or st._data_dir_line:
+                st.diag(
+                    f" warning - no relocation type available for a {num_bytes}-byte "
+                    f"reference to '{lname}'; relocation omitted.", set_error=False)
+            return
+
+        sec_rel = self._sec_off(first_widx)
+        raw_val = 0
+        for k in range(num_words):
+            if first_widx + k < len(objl):
+                if self.little:
+                    raw_val |= (int(objl[first_widx + k]) & self.wm) << (self.bts * k)
+                else:
+                    raw_val = (raw_val << self.bts) | (int(objl[first_widx + k]) & self.wm)
+
+        if (isinstance(abs_w, float) and not math.isfinite(abs_w)) or \
+           _is_undef_derived(abs_w):
+            return
+
+        _field_bits = num_words * self.bts
+        if _field_bits > 0 and raw_val >= (1 << (_field_bits - 1)):
+            raw_val -= (1 << _field_bits)
+
+        abs_wi = int(abs_w)
+
+        if (_rtype_is_default_guess and rtype in self.pc_rel
+                and raw_val == abs_wi):
+            _alt = _reloc_same_width(mach, num_bytes, False)
+            if _alt is not None:
+                rtype = _alt
+
+        # 欄がオペランドの値（ラベル＋綴りの定数）を持たなければ、パターンが変位を計算した
+        # として PC 相対の型にする（欄の幅のビットで比べる）。caxx.c の lineassemble() と同じ。
+        _pcg_d = raw_val - (abs_wi + st.elf.insn_reloc_hint.get(('v', first_widx), 0))
+        if 0 < _field_bits < 64:
+            _pcg_d &= (1 << _field_bits) - 1
+        if (_rtype_is_default_guess and mach['pcrel_guess']
+                and rtype not in self.pc_rel
+                and _pcg_d != 0):
+            _alt = _reloc_data_pcrel(mach, num_bytes)
+            if _alt is not None:
+                rtype = _alt
+
+        # `.elfunaligned`: 位置が欄の幅の倍数でなければその型（SPARC の UA64。llvm-mc と同じ）。
+        _ua = mach.get('unaligned', {}).get(rtype)
+        if _ua is not None and num_bytes > 0 and sec_rel % num_bytes != 0:
+            rtype = _ua
+
+        # `.elfresolve`: この型が同じセクションの局所ラベルを指すなら、欄はパターンが
+        # 書いたまま（-b と同じ計算）でリロケーションは出さない（緩和する機種は除く）。
+        # `.elffield` の無い型（x86-64 の pc32 など）はここで見る。caxx.c と同じ。
+        if (mach.get('resolve') and not _elf_relaxing(st)
+                and rtype in mach['resolve'] and self._local_here(lname)):
+            return
+
+        # 加数はワードで求めてから単位（.elfunit）に直す。
+        if rtype in self.pc_rel:
+            _P_adj = self.asm.label_manager._section_relative_offset(
+                st.current_section, st.pc + first_widx)
+            _P_w = _P_adj if _P_adj is not None else st.pc + first_widx
+            # 欄は幅で切られているので、綴りの定数を除いた部分（位置と変位の基点の差）を
+            # 欄の幅で符号付きに折り返す（caxx.c の lineassemble() と同じ）。
+            _cst = st.elf.insn_reloc_hint.get(('v', first_widx), 0)
+            _pd = raw_val - abs_wi + _P_w - _cst
+            if 0 < _field_bits < 64:
+                _pd &= (1 << _field_bits) - 1
+                if _pd >= (1 << (_field_bits - 1)):
+                    _pd -= 1 << _field_bits
+            addend = (_cst + _pd) * self.scale
+        else:
+            addend = (raw_val - abs_wi) * self.scale
+
+        # REL では書き出しのときに加数を欄へ書き戻す。
+        if mach['is_rela']:
+            self._zero(first_widx, num_words)
+        self._put(sec_rel, lname, rtype, addend, num_bytes)
+
+
 class Assembler:
     """アセンブラ全体の組み立てと駆動（入口は run()）。部品をつなぎ、パス1とパス2を回して出力を書く。"""
 
@@ -10610,31 +11024,23 @@ class Assembler:
         self.expr_eval = ExpressionEvaluator(st, self.var_manager, self.label_manager,
                                              self.symbol_manager, self.parser)
         self.binary_writer = BinaryWriter(st)
-        self.directive_proc = DirectiveProcessor(st, self.expr_eval, self.binary_writer,
-                                                 self.symbol_manager, self.parser)
+        self.directive_proc = DirectiveProcessor(st, self.expr_eval)
         self.pattern_matcher = PatternMatcher(st, self.expr_eval, self.var_manager,
                                               self.symbol_manager, self.parser)
         self.pat_macro_proc = MacroPreprocessor(st, pat_mode=True)
         self.pattern_reader = PatternFileReader(self.parser, self.pat_macro_proc)
-        self.obj_gen = ObjectGenerator(st, self.expr_eval, self.binary_writer)
+        self.obj_gen = ObjectGenerator(st, self.expr_eval)
         self.vliw_proc = VLIWProcessor(st, self.expr_eval, self.binary_writer)
         self.asm_directive_proc = AssemblyDirectiveProcessor(st, self.expr_eval, self.binary_writer,
                                                              self.label_manager, self.parser)
         self.macro_proc = MacroPreprocessor(st)
         self._imp_sections: list = []      # (名前, 開始, 大きさ) をファイルの順に
         d = self.asm_directive_proc
-        self._adir_first = (d.section_processing, d.endsection_processing,
-                            d.resb_processing, d.zero_processing)
-        self._adir_rest = (d.align_processing, d.org_processing, d.labelc_processing,
-                           d.extern_processing, d.reloctype_processing, d.export_processing,
-                           d.cfi_processing, d.type_processing, d.size_processing,
-                           d.weak_processing, d.visibility_processing, d.other_processing,
-                           d.comm_processing)
+        self._adir_table = {n: (getattr(d, h) if h != 'include_asm' else self.include_asm, kind)
+                            for names, h, kind in self._ADIR_TABLE for n in names}
 
     def include_asm(self, l1, l2):
         """ソース側の `.include`（相対パスはいまのファイルの場所から）。"""
-        if StringUtils.upper(l1) != ".INCLUDE":
-            return False
         st = self.state
         s = StringUtils.get_string(l2)
         if not s:
@@ -10642,7 +11048,7 @@ class Assembler:
             fallback = StringUtils.get_param_to_spc(raw, 0)[0] if raw else ''
             if not fallback:
                 st.diag(f" error - .INCLUDE directive has no filename: {l2!r}", set_error=True)
-                return True
+                return
             st.diag(f" warning - .INCLUDE filename not quoted: {fallback!r}. "
                     "Please use double quotes.", set_error=False)
             s = fallback
@@ -10651,7 +11057,6 @@ class Assembler:
             if cur and cur not in ("(stdin)", ""):
                 s = os.path.join(os.path.dirname(os.path.abspath(cur)), s)
         self.fileassemble(s)
-        return True
 
     def _dir_line_done(self, l, l2, idx):
         """ディレクティブ行を処理し終えたときの後片付け。"""
@@ -10688,6 +11093,31 @@ class Assembler:
     _MATCH_EXC = (ArithmeticError, KeyError, IndexError, ValueError,
                   TypeError, AttributeError, OverflowError, struct.error)
 
+    # ソース側の組み込みディレクティブ: (大文字の名前の組, ハンドラ名, 種類)。種類は
+    # 'dir'（処理して行を閉じる）/ 'data'（ワード列を返す）/ 'ascii' / 'include'。
+    _ADIR_TABLE = (
+        (('.SECTION', '.SEGMENT'), 'section_processing', 'dir'),
+        (('.ENDSECTION', '.ENDSEGMENT'), 'endsection_processing', 'dir'),
+        (('.RESB', '.RESW', '.RESD', '.RESQ'), 'resb_processing', 'dir'),
+        (('.ZERO',), 'zero_processing', 'dir'),
+        (('.DB', '.DW', '.DD', '.DQ', '.DO', '.DY', '.DZ'), 'data_processing', 'data'),
+        (('.ASCII',), 'ascii_processing', 'ascii'),
+        (('.ASCIZ',), 'asciiz_processing', 'ascii'),
+        (('.INCLUDE',), 'include_asm', 'include'),
+        (('.ALIGN',), 'align_processing', 'dir'),
+        (('.ORG',), 'org_processing', 'dir'),
+        (('.LABELC',), 'labelc_processing', 'dir'),
+        (('.EXTERN',), 'extern_processing', 'dir'),
+        (('.RELOCTYPE',), 'reloctype_processing', 'dir'),
+        (('.EXPORT', '.GLOBAL'), 'export_processing', 'dir'),
+        (('.TYPE',), 'type_processing', 'dir'),
+        (('.SIZE',), 'size_processing', 'dir'),
+        (('.WEAK',), 'weak_processing', 'dir'),
+        (('.HIDDEN', '.PROTECTED', '.INTERNAL'), 'visibility_processing', 'dir'),
+        (('.OTHER',), 'other_processing', 'dir'),
+        (('.COMM',), 'comm_processing', 'dir'),
+    )
+
     def lineassemble2(self, line, idx):
         """1 命令（VLIW なら 1 スロット）をアセンブルする。返り値は (インデックス, ワード列, 成否, 次の位置)。
 
@@ -10705,28 +11135,26 @@ class Assembler:
         # 組み込みディレクティブ（`.org $$+4` など）は通し番地で読む。
         st._sec_frame = False
 
-        if st.textmode and StringUtils.upper(l) in _TEXTMODE_TEXT_ONLY_DIRS:
-            return self._passthru_line(l, l2, idx)
-        for h in self._adir_first:
-            if h(l, l2):
-                return self._dir_line_done(l, l2, idx)
-        data_words = self.asm_directive_proc.data_processing(l, l2)
-        if data_words is not None:
-            return 0, data_words, True, idx
         lu = StringUtils.upper(l)
-        if lu in ('.ASCII', '.ASCIZ'):
-            ok = (self.asm_directive_proc.ascii_processing if lu == '.ASCII'
-                  else self.asm_directive_proc.asciiz_processing)(l, l2)
-            if not ok and st.should_report_errors():
+        if st.textmode and lu in _TEXTMODE_TEXT_ONLY_DIRS:
+            return self._passthru_line(l, l2, idx)
+        h, kind = self._adir_table.get(lu, (None, None))
+        if h is None and lu.startswith('.CFI_'):
+            h, kind = self.asm_directive_proc.cfi_processing, 'dir'
+        if kind == 'dir':
+            h(l, l2)
+            return self._dir_line_done(l, l2, idx)
+        if kind == 'data':
+            return 0, h(l, l2), True, idx
+        if kind == 'ascii':
+            if not h(l, l2) and st.should_report_errors():
                 st.diag(f" error - {lu}: failed to process string argument: {l2!r}", set_error=True)
             return 0, [], True, idx
-        if self.include_asm(l, l2):
+        if kind == 'include':
+            h(l, l2)
             st.comment_text = ''
             st.indent_text = ''
             return 0, [], True, idx
-        for h in self._adir_rest:
-            if h(l, l2):
-                return self._dir_line_done(l, l2, idx)
 
         if l == "":
             if st.textmode and (st.label_text or st.comment_text):
@@ -10735,36 +11163,99 @@ class Assembler:
 
         # ここからはパターンの照合。-o / -E ではセクション相対で読む（_sec_frame）。
         st._sec_frame = True
-        se = False
-        oerr = False
-        pln = 0
-        pl = ""
-        idxs = 0
+        lin = StringUtils.reduce_spaces((l + ' ' + l2) if l2 else l)
+        best, hit_sentinel, idxs, first_match_exc, exc_log = self._match_line(lin)
+
+        if best is not None and exc_log and (st.verbose or st.debug):
+            _other_plns = sorted({e[0] for e in exc_log if e[0] != best['pln']})
+            if _other_plns:
+                st.diag(f" warning - {len(_other_plns)} other candidate pattern(s) at line(s) "
+                        f"{_other_plns} raised an exception during matching and were skipped "
+                        f"in favor of pattern line {best['pln']}.  "
+                        f"[{st.current_file}:{st.ln}]", set_error=False)
+
         objl = []
-        loopflag = True
+        se = oerr = False
+        pln, pl = 0, ""
+        if best is not None:
+            idxs, objl, oerr = self._assemble_best(best)
+            pln, pl = best['pln'], best['pat']
+        elif hit_sentinel:
+            pass
+        elif first_match_exc is not None:
+            pln, pl = first_match_exc
+            oerr = True
+        else:
+            se = True
+
+        if se and st.passthru:
+            return self._passthru_line(l, l2, idx)
+
+        if st.should_report_errors():
+            _loc = f"  [{st.current_file}:{st.ln}]"
+            if st.error_undefined_label:
+                st.had_error = True
+                st.diag(f" error - Undefined label in expression.{_loc}", set_error=False)
+                return 0, [], False, idx
+            if se:
+                st.had_error = True
+                st.diag(f" error - Syntax error.{_loc}", set_error=False)
+                return 0, [], False, idx
+            if oerr:
+                st.had_error = True
+                st.diag(f" error - Illegal syntax in assemble line or pattern line.{_loc}", set_error=False)
+                if st.debug:
+                    st.diag(f"   (pattern {pln}: {pl})", set_error=False)
+                return 0, [], False, idx
+
+        return idxs, objl, True, idx
+
+    @staticmethod
+    def _mnemonic_at_head(lin, pfx, closed):
+        """ソース行 lin（空白は飛ばす）の頭が、パターンの先頭大文字列 pfx か。
+
+        closed（書式の大文字列がそこで閉じる）なら、続く文字が語を続けないときだけ真。
+        """
+        k = 0
+        for ci, ch in enumerate(lin):
+            if ch == ' ':
+                continue
+            if _AUP1.get(ch, ch) != pfx[k]:
+                return False
+            k += 1
+            if k == len(pfx):
+                return not (closed and ci + 1 < len(lin) and lin[ci + 1] in _WORD_CHARS)
+        return False
+
+    def _match_line(self, lin):
+        """ソース行 lin を候補のパターンすべてと照合し、特異度スコアが最良のものを選ぶ。
+
+        候補は always（鍵の無い行とディレクティブ）と索引で引いた行を行番号順に合流させたもの。
+        ディレクティブ行はその場で処理する（持ち上げた範囲は 1 度だけ処理して写しを取る）。
+        返り値は (採択の記録か None, 番兵行 `::` に当たったか, 番兵のインデックス,
+        最初に例外を出した (行番号, 行), 例外の記録)。
+        """
+        st = self.state
+        _isdir = st.pat_isdir
+        _pat = st.pat
+        _dirfn = st.pat_dirfn
+        _always = st.pat_always
+        _cand = _pat_candidates(st.pat_index, st.pat_maxkey, lin)
+        _na = len(_always)
+        _nc = len(_cand)
+        _hoist = st.hoist_rows
+        _ai = st.hoist_first_ai if (_hoist and st.hdrsnap is not None) else 0
+        _ci2 = 0
+        _hoist_diag0 = st.diag_count
         best = None
         hit_sentinel = False
+        idxs = 0
         first_match_exc = None
         exc_log = []
 
-        lin = StringUtils.reduce_spaces((l + ' ' + l2) if l2 else l)
-
-        _isdir = self.state.pat_isdir
-        _pat = self.state.pat
-        _dirfn = self.state.pat_dirfn
-
-        _always = self.state.pat_always
-        _cand = _pat_candidates(self.state.pat_index, self.state.pat_maxkey, lin)
-        _na = len(_always)
-        _nc = len(_cand)
-        _hoist = self.state.hoist_rows
-        _ai = self.state.hoist_first_ai if (_hoist and self.state.hdrsnap is not None) else 0
-        _ci2 = 0
-        _hoist_diag0 = self.state.diag_count
-
-        if self.state.unordered:
+        if st.unordered:
             # `.unordered` ではディレクティブ行を決めておいた順に全部処理してから、パターンだけを試す。
-            for _row in self.state.pat_dirorder:
+            for _row in st.pat_dirorder:
                 self._clear_vars()
                 _fn = _dirfn[_row]
                 if _fn is not None:
@@ -10789,12 +11280,11 @@ class Assembler:
 
             i = _pat[_row]
             pln = _row + 1
-            pl = i
 
-            if _hoist and self.state.hdrsnap is None and _row >= _hoist:
-                if self.state.diag_count != _hoist_diag0:
+            if _hoist and st.hdrsnap is None and _row >= _hoist:
+                if st.diag_count != _hoist_diag0:
                     _hoist = 0
-                    self.state.hoist_rows = 0
+                    st.hoist_rows = 0
                 else:
                     self._hdrsnap_take()
 
@@ -10802,14 +11292,7 @@ class Assembler:
                 continue
 
             if _isdir[_row]:
-                if self.state.vars:
-                    self.state.vars = {}
-                if self.state.vars_undef:
-                    self.state.vars_undef = {}
-                if self.state.vars_float:
-                    self.state.vars_float = {}
-                if self.state.vars_text:
-                    self.state.vars_text = {}
+                self._clear_vars()
                 _fn = _dirfn[_row]
                 if _fn is not None and _fn(i):
                     continue
@@ -10826,45 +11309,27 @@ class Assembler:
 
             if _from_always:
                 _pfx, _closed = _lead_caps(i[0])
-                if _pfx:
-                    _k = 0
-                    _ok = True
-                    _end = -1
-                    for _ci, _ch in enumerate(lin):
-                        if _ch == ' ':
-                            continue
-                        if _AUP1.get(_ch, _ch) != _pfx[_k]:
-                            _ok = False
-                            break
-                        _k += 1
-                        if _k == len(_pfx):
-                            _end = _ci + 1
-                            break
-                    if _k < len(_pfx):
-                        _ok = False
-                    if _ok and _closed and _end < len(lin) and lin[_end] in _PFX_WORD:
-                        _ok = False
-                    if not _ok:
-                        continue
+                if _pfx and not self._mnemonic_at_head(lin, _pfx, _closed):
+                    continue
 
             self._clear_vars()
-            self.state.error_undefined_label = False
-            self.state.expcaps = CAPS_ASM
+            st.error_undefined_label = False
+            st.expcaps = CAPS_ASM
             saved = self.pattern_matcher._try_save()
 
             _cand_diags = []
             try:
-                self.state._in_match_attempt = True
-                self.state.diag_capture_begin()
+                st._in_match_attempt = True
+                st.diag_capture_begin()
                 _match_result = self.pattern_matcher.match0(lin, i[0])
             except self._MATCH_EXC as _pat_exc:
                 _match_result = False
                 if first_match_exc is None:
-                    first_match_exc = (pln, pl)
-                exc_log.append((pln, pl, type(_pat_exc).__name__, str(_pat_exc)))
+                    first_match_exc = (pln, i)
+                exc_log.append((pln, i, type(_pat_exc).__name__, str(_pat_exc)))
             finally:
-                self.state._in_match_attempt = False
-                _cand_diags = self.state.diag_capture_take()
+                st._in_match_attempt = False
+                _cand_diags = st.diag_capture_take()
 
             if _match_result is True:
                 score = self.pattern_matcher.last_match_score
@@ -10873,124 +11338,88 @@ class Assembler:
                         'score': score,
                         'pln':   pln,
                         'pat':   i,
-                        'vars':  dict(self.state.vars),
-                        'vars_undef': dict(self.state.vars_undef),
-                        'vars_float': dict(self.state.vars_float),
-                        'vars_text': dict(self.state.vars_text),
-                        'refs':  self.state.elf.label_refs_seen[saved[4]:],
-                        'v2l':   dict(self.state.elf.var_to_label),
-                        'hint':  dict(self.state.elf.insn_reloc_hint),
+                        'vars':  dict(st.vars),
+                        'vars_undef': dict(st.vars_undef),
+                        'vars_float': dict(st.vars_float),
+                        'vars_text': dict(st.vars_text),
+                        'refs':  st.elf.label_refs_seen[saved[4]:],
+                        'v2l':   dict(st.elf.var_to_label),
+                        'hint':  dict(st.elf.insn_reloc_hint),
                         'dir':   self._snap_dirstate(),
-                        'error_undefined_label': self.state.error_undefined_label,
+                        'error_undefined_label': st.error_undefined_label,
                         'diags': _cand_diags,
                     }
 
                 self.pattern_matcher._try_restore(saved)
 
-            self.state.error_undefined_label = False
+            st.error_undefined_label = False
+        return best, hit_sentinel, idxs, first_match_exc, exc_log
 
-        if best is not None and exc_log and (self.state.verbose or self.state.debug):
+    def _assemble_best(self, best):
+        """採択したパターン best の状態（束縛・ディレクティブ・-o の参照）を戻し、
+        error_patterns を見て、通れば binary_list からワード列を作る。
 
-            _other_plns = sorted({e[0] for e in exc_log if e[0] != best['pln']})
-            if _other_plns:
-                self.state.diag(f" warning - {len(_other_plns)} other candidate pattern(s) at line(s) "
-                     f"{_other_plns} raised an exception during matching and were skipped "
-                     f"in favor of pattern line {best['pln']}.  "
-                     f"[{self.state.current_file}:{self.state.ln}]", set_error=False)
+        先に長さだけを測って pc_instr_end（`$.`）を決める。返り値は (インデックス, ワード列,
+        評価で例外が出たか)。パス1の例外は長さだけを測る形でやり直す（前方参照のため）。
+        """
+        st = self.state
+        i = best['pat']
+        idxs = 0
+        objl = []
+        oerr = False
 
-        if best is not None:
-            i = best['pat']
-            pln = best['pln']
-            pl = i
-            loopflag = False
+        self._restore_dirstate(best['dir'])
+        st.vars = dict(best['vars'])
+        st.vars_undef = dict(best['vars_undef'])
+        st.vars_float = dict(best['vars_float'])
+        st.vars_text = dict(best['vars_text'])
+        st.elf.label_refs_seen.extend(best['refs'])
+        st.elf.var_to_label = dict(best['v2l'])
+        st.elf.insn_reloc_hint = dict(best['hint'])
+        st.error_undefined_label = best['error_undefined_label']
+        st.diag_replay(best['diags'])
+        st.expcaps = CAPS_ASM
 
-            self._restore_dirstate(best['dir'])
-            self.state.vars = dict(best['vars'])
-            self.state.vars_undef = dict(best['vars_undef'])
-            self.state.vars_float = dict(best['vars_float'])
-            self.state.vars_text = dict(best['vars_text'])
-            self.state.elf.label_refs_seen.extend(best['refs'])
-            self.state.elf.var_to_label = dict(best['v2l'])
-            self.state.elf.insn_reloc_hint = dict(best['hint'])
-            self.state.error_undefined_label = best.get('error_undefined_label', False)
-            self.state.diag_replay(best.get('diags', ()))
-            self.state.expcaps = CAPS_ASM
-
+        try:
+            st.pc_instr_start = st.pc
+            st.pc_instr_end = st.pc_instr_start
+            _probe_sm_saved = st.relax.pass1_size_mode
+            _probe_refs_len = len(st.elf.label_refs_seen)
+            _probe_widx_saved = st.elf.current_word_idx
+            _probe_hint_saved = dict(st.elf.insn_reloc_hint)
+            st.relax.pass1_size_mode = True
             try:
-                self.state.pc_instr_start = self.state.pc
-                self.state.pc_instr_end   = self.state.pc_instr_start
-                _probe_sm_saved    = self.state.relax.pass1_size_mode
-                _probe_refs_len    = len(self.state.elf.label_refs_seen)
-                _probe_widx_saved  = self.state.elf.current_word_idx
-                _probe_hint_saved  = dict(self.state.elf.insn_reloc_hint)
-                self.state.relax.pass1_size_mode = True
+                _probe_objl = self.obj_gen.makeobj(i[2])
+                st.pc_instr_end = st.pc_instr_start + len(_probe_objl)
+            except Exception:
+                pass
+            finally:
+                st.relax.pass1_size_mode = _probe_sm_saved
+                del st.elf.label_refs_seen[_probe_refs_len:]
+                st.elf.current_word_idx = _probe_widx_saved
+                st.elf.insn_reloc_hint = _probe_hint_saved
+                st.error_undefined_label = best['error_undefined_label']
+            err_triggered, _err_code = self.directive_proc.error(i[1])
+            if not err_triggered:
+                objl = self.obj_gen.makeobj(i[2])
+            idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+        except self._MATCH_EXC as _exc:
+            if st.relax.pas == 1:
+                if st.debug:
+                    print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}", file=sys.stderr)
+                    traceback.print_exc()
                 try:
-                    _probe_objl = self.obj_gen.makeobj(i[2])
-                    self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
-                except Exception:
-                    pass
-                finally:
-                    self.state.relax.pass1_size_mode = _probe_sm_saved
-                    del self.state.elf.label_refs_seen[_probe_refs_len:]
-                    self.state.elf.current_word_idx = _probe_widx_saved
-                    self.state.elf.insn_reloc_hint = _probe_hint_saved
-                    self.state.error_undefined_label = best.get('error_undefined_label', False)
-                err_triggered, _err_code = self.directive_proc.error(i[1])
-                if not err_triggered:
+                    st.relax.pass1_size_mode = True
                     objl = self.obj_gen.makeobj(i[2])
-                else:
+                    idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                except self._MATCH_EXC:
                     objl = []
-                idxs, _ = self.expr_eval.expression_pat(i[3], 0)
-            except self._MATCH_EXC as _exc:
-                if self.state.relax.pas == 1:
-                    if self.state.debug:
-                        import traceback as _tb
-                        print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}", file=sys.stderr)
-                        _tb.print_exc()
-                    try:
-                        self.state.relax.pass1_size_mode = True
-                        objl = self.obj_gen.makeobj(i[2])
-                        idxs, _ = self.expr_eval.expression_pat(i[3], 0)
-                    except self._MATCH_EXC:
-                        objl = []
-                    finally:
-                        self.state.relax.pass1_size_mode = False
-                        self.state.error_undefined_label = False
-                else:
-                    oerr = True
-        elif hit_sentinel:
-            loopflag = False
-        elif first_match_exc is not None:
-            pln, pl = first_match_exc
-            oerr = True
-            loopflag = False
-
-        if loopflag:
-            se = True
-            pln = 0
-            pl = ""
-
-        if se and self.state.passthru:
-            return self._passthru_line(l, l2, idx)
-
-        if self.state.should_report_errors():
-            _loc = f"  [{self.state.current_file}:{self.state.ln}]"
-            if self.state.error_undefined_label:
-                self.state.had_error = True
-                self.state.diag(f" error - Undefined label in expression.{_loc}", set_error=False)
-                return 0, [], False, idx
-            if se:
-                self.state.had_error = True
-                self.state.diag(f" error - Syntax error.{_loc}", set_error=False)
-                return 0, [], False, idx
-            if oerr:
-                self.state.had_error = True
-                self.state.diag(f" error - Illegal syntax in assemble line or pattern line.{_loc}", set_error=False)
-                if self.state.debug:
-                    self.state.diag(f"   (pattern {pln}: {pl})", set_error=False)
-                return 0, [], False, idx
-
-        return idxs, objl, True, idx
+                finally:
+                    st.relax.pass1_size_mode = False
+                    st.error_undefined_label = False
+            else:
+                oerr = True
+        return idxs, objl, oerr
 
     def _text_words(self, txt):
         """テキストを出力ワードの並びにする（UTF-8 の 1 バイトが 1 ワード）。"""
@@ -11015,556 +11444,131 @@ class Assembler:
 
     def lineassemble(self, line):
         """ソース 1 行を処理する（ラベル・`!!` の分解・テキスト置換モード・-o のリロケーション）。"""
+        st = self.state
         _ind = line[:len(line) - len(line.lstrip(' \t'))][:511]
-        self.state.indent_text = _ind if self.state.textmode else ''
+        st.indent_text = _ind if st.textmode else ''
         line = StringUtils.normalize_ws(line)
         line, _cmt = StringUtils.split_comment_asm(line)
-        self.state.comment_text = _cmt if self.state.textmode else ''
-        if line == '' and not self.state.comment_text:
+        st.comment_text = _cmt if st.textmode else ''
+        if line == '' and not st.comment_text:
             return False
         line = StringUtils.resolve_vliw_escapes(line)
 
-        if self.state.hoist_rows and self.state.hdrsnap is not None:
+        if st.hoist_rows and st.hdrsnap is not None:
             self._hdrsnap_restore()
-            self.state.freed_subs.clear()
+            st.freed_subs.clear()
         else:
-            for d in (self.state.check_constraints, self.state.reloc_constraints,
-                      self.state.reloc_masks, self.state.reloc_pairs, self.state.enum_defs,
-                      self.state.freed_subs):
+            for d in (st.check_constraints, st.reloc_constraints,
+                      st.reloc_masks, st.reloc_pairs, st.enum_defs,
+                      st.freed_subs):
                 d.clear()
-            self.state.symbols = dict(self.state.patsymbols)
+            st.symbols = dict(st.patsymbols)
 
-        self.state.label_text = ''
-        self.state._data_dir_line = False
+        st.label_text = ''
+        st._data_dir_line = False
         line = self.asm_directive_proc.label_processing(line)
 
         _vparts = line.replace(VLIW_STOP, VLIW_SEP).split(VLIW_SEP)
-        self.state.vliw.cnt = sum(1 for _p in _vparts if _p != '')
+        st.vliw.cnt = sum(1 for _p in _vparts if _p != '')
 
-        if self.state.elf.objfile and self.state.relax.pas == 2:
-            e = self.state.elf
+        if st.elf.objfile and st.relax.pas == 2:
+            e = st.elf
             e.tracking = True
             e.label_refs_seen = []
             e.current_word_idx = -1
             e.var_to_label = {}
             e.capturing_var = None
             e.insn_reloc_hint = {}
-            self.state._elf_field_breaks = set()
-            self.state._elf_data_fields = set()
+            st._elf_field_breaks = set()
+            st._elf_data_fields = set()
 
         try:
             idxs, objl, flag, idx = self.lineassemble2(line, 0)
         finally:
-            self.state.elf.tracking = False
-            self.state._sec_frame = False
+            st.elf.tracking = False
+            st._sec_frame = False
 
         if not flag:
             # 先頭のスロットが空の行（`!!ad ...`、`!!!!` だけ）はエラー（caxx.c の lineassemble()）。
             _vl = line.lstrip(' \t')
-            if _vl[:1] in (VLIW_SEP, VLIW_STOP) and self.state.should_report_errors():
-                self.state.diag(_VLIW_EMPTY_SLOT_MSG, set_error=True)
+            if _vl[:1] in (VLIW_SEP, VLIW_STOP) and st.should_report_errors():
+                st.diag(_VLIW_EMPTY_SLOT_MSG, set_error=True)
             return False
 
-        if (self.state.textmode and self.state.label_text
-                and not self.state.vliw.flag
-                and (self.state.asmtext is not None or not objl)):
-            _lpfx = self.state.label_text
-            _ltxt = self.state.asmtext
-            if _ltxt:
-                _lpfx += ' '
-            _lbytes = list(_lpfx.encode('utf-8', errors='surrogateescape'))
-            objl[0:0] = _lbytes
-            self.state.asmtext = _lpfx + (_ltxt or '')
-            self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
-            self._shift_refs(len(_lbytes))
+        if st.textmode and not st.vliw.flag:
+            self._textmode_decorate(objl)
 
-        if (self.state.textmode and self.state.comment_text
-                and not self.state.vliw.flag
-                and (self.state.asmtext is not None or not objl)):
-            _ctxt = self.state.comment_text
-            _cur = self.state.asmtext or ''
-            _csfx = (' ' + _ctxt) if _cur else _ctxt
-            objl.extend(self._text_words(_csfx))
-            self.state.asmtext = _cur + _csfx
-            self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
-
-        if (self.state.textmode and self.state.indent_text
-                and not self.state.vliw.flag
-                and self.state.asmtext):
-            _itxt = self.state.indent_text
-            _ibytes = list(_itxt.encode('utf-8', errors='surrogateescape'))
-            objl[0:0] = _ibytes
-            self.state.asmtext = _itxt + self.state.asmtext
-            self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
-            self._shift_refs(len(_ibytes))
-
-        if (self.state.eol and objl and not self.state.vliw.flag
-                and not self.state._data_dir_line):
+        if (st.eol and objl and not st.vliw.flag
+                and not st._data_dir_line):
             objl.append(ord('\n'))
 
         # `.vliw` の無いパターンファイルで `!!` が続く行はエラー（caxx.c の lineassemble()）。
         _vrest = line[idx:].lstrip(' ')
-        if not self.state.vliw.flag and _vrest[:1] in (VLIW_SEP, VLIW_STOP):
-            if self.state.should_report_errors():
-                self.state.diag(_VLIW_NO_VLIW_MSG, set_error=True)
+        if not st.vliw.flag and _vrest[:1] in (VLIW_SEP, VLIW_STOP):
+            if st.should_report_errors():
+                st.diag(_VLIW_NO_VLIW_MSG, set_error=True)
             return False
 
-        if not self.state.vliw.flag or (idx >= len(line) or line[idx] not in (VLIW_SEP, VLIW_STOP)):
+        if not st.vliw.flag or (idx >= len(line) or line[idx] not in (VLIW_SEP, VLIW_STOP)):
             of = len(objl)
-            if self.state.elf.objfile and self.state.relax.pas == 2 and objl and self.state.elf.label_refs_seen:
-                bpw_r = max(1, (self.state.bts + 7) // 8)
-                sec_name_r = self.state.current_section
+            if st.elf.objfile and st.relax.pas == 2 and objl and st.elf.label_refs_seen:
+                self._line_relocations(objl)
 
-                _completed_words = 0
-                _entry_pc_cur = 0
-                if sec_name_r in self.state.sections:
-                    _sentry = self.state.sections[sec_name_r]
-                    _completed_words = _sentry[1]
-                    _entry_pc_cur = _sentry[2] if len(_sentry) > 2 else _sentry[0]
-
-                valid_refs = sorted((r for r in self.state.elf.label_refs_seen if r[2] >= 0),
-                                    key=lambda r: r[2])
-                # 同じ（ラベル, ワード位置）は最初の 1 つだけ。
-                _seen = set()
-                valid_refs = [r for r in valid_refs
-                              if (r[0], r[2]) not in _seen and not _seen.add((r[0], r[2]))]
-
-                _widx_labels = {}
-                for _ln, _, _wi in valid_refs:
-                    _widx_labels.setdefault(_wi, set()).add(_ln)
-                _ambiguous = {_wi for _wi, ns in _widx_labels.items() if len(ns) > 1}
-                valid_refs = [r for r in valid_refs if r[2] not in _ambiguous]
-
-                groups = []
-                gi = 0
-                while gi < len(valid_refs):
-                    lname, abs_w, widx = valid_refs[gi]
-                    gj = gi + 1
-                    while (gj < len(valid_refs) and valid_refs[gj][0] == lname
-                           and valid_refs[gj][2] == widx + (gj - gi)
-                           and valid_refs[gj][2] not in self.state._elf_field_breaks):
-                        gj += 1
-                    groups.append((lname, abs_w, widx, gj - gi))
-                    gi = gj
-
-                _mach_tbl_la = elf_machine_table(self.state)
-                _rmap = {**_mach_tbl_la['width_guess'], **self.state.elf.reloctype_override}
-                _pc_rel_types_all = _mach_tbl_la['pc_rel']
-                # 加数の単位（byte ならワードのバイト数を掛ける）。
-                _scale = 1 if _mach_tbl_la['unit'] == 'word' else bpw_r
-                _bts = self.state.bts
-                _wm = (1 << _bts) - 1
-                _little = self.state.endian == 'little'
-
-                def _wsh(k, nw):
-                    # 欄の k 番目のワードの、欄の値の中でのシフト量（バイト順に従う）。
-                    return _bts * k if _little else _bts * (nw - 1 - k)
-
-                def _field_raw(first, nwords):
-                    # 欄のワード列を 1 つの整数に読み、符号を付ける。
-                    rv = 0
-                    for k in range(nwords):
-                        if first + k < len(objl):
-                            rv |= (int(objl[first + k]) & _wm) << _wsh(k, nwords)
-                    fb = nwords * _bts
-                    if fb > 0 and rv >= (1 << (fb - 1)):
-                        rv -= (1 << fb)
-                    return rv
-
-                def _zero(first, nwords):
-                    # RELA では加数を項目が持つので欄は 0 で出す（GNU as と llvm-mc の形）。
-                    for k in range(nwords):
-                        if first + k < len(objl):
-                            objl[first + k] = 0
-
-                def _clear_mask(w, nw, mask):
-                    # 命令欄のマスクのビットだけを消す。
-                    for k in range(nw):
-                        objl[w + k] = int(objl[w + k]) & ~((mask >> _wsh(k, nw)) & _wm) & _wm
-
-                def _sec_off(w):
-                    # 出力ワード w のセクションの中のバイト位置。
-                    return (_completed_words + (self.state.pc + w - _entry_pc_cur)) * bpw_r
-
-                def _local_here(nm):
-                    # 同じセクションの局所ラベル（外部・.equ・.global・.weak でない）か。
-                    le = self.state.labels.get(nm)
-                    return (le is not None and not (len(le) > 3 and le[3])
-                            and not (len(le) > 2 and le[2]) and le[1] and le[1] == sec_name_r
-                            and nm not in self.state.export_labels
-                            and not _sym_attr(self.state, nm)[_SA_WEAK])
-
-                def _src_type(le, nm, nbytes):
-                    # ラベルに付いた型（幅が合うときだけ。型を書かない .extern は除く）。
-                    src = le[4] if (le and len(le) > 4 and le[4] is not None) else None
-                    if src is not None and nm not in self.state.extern_untyped:
-                        ex = _mach_tbl_la['reloc_bytes'].get(src)
-                        if ex is None or ex == nbytes:
-                            return src
-                    return None
-
-                for lname, abs_w, first_widx, num_words in groups:
-                    num_bytes = num_words * bpw_r
-
-                    _dinfo = self.state.elf.insn_reloc_hint.get(('d', first_widx))
-                    if _dinfo is not None:
-                        # ラベル差（ラベルの 1 次結合）。足す項には足す型、引く項には引く型を同じ位置に。
-                        # 定数部は最初の足す項（無ければ最初の引く項に符号を反転して）の加数。
-                        if first_widx >= len(objl):
-                            continue
-                        _dterms, _drt, _dcst, _dfmask = _dinfo
-                        if _drt is None and len(_dterms) == 2:
-                            # 「ラベル − `$$`」（`.elfpcguess::1`）。同じセクションのラベルなら欄の値のまま、
-                            # 違えばその幅の PC 相対の型で加数は定数部（caxx.c の lineassemble() と同じ）。
-                            _pl = next((n for sg, n in _dterms if sg > 0), None)
-                            if _pl is not None and any(sg < 0 and n == '$$' for sg, n in _dterms):
-                                _ple = self.state.labels.get(_pl)
-                                _same = (_ple is not None and not (len(_ple) > 3 and _ple[3])
-                                         and _ple[1] == sec_name_r)
-                                if not _same:
-                                    _prt = _src_type(_ple, _pl, num_bytes)
-                                    # その幅の `.elfdiff` があれば対にし、引く項はこの欄のアンカー
-                                    # （llvm-mc が RISC-V の `.quad ext-.` に付ける形）。
-                                    _ppair = (_mach_tbl_la['diff'].get(num_bytes)
-                                              if _prt is None else None)
-                                    if _prt is None and _ppair is None:
-                                        _prt = _reloc_data_pcrel(_mach_tbl_la, num_bytes)
-                                    if _prt is None and _ppair is None:
-                                        if self.state.debug:
-                                            self.state.diag(
-                                                f" warning - no PC-relative relocation type for a "
-                                                f"{num_bytes}-byte reference to '{_pl}'; relocation "
-                                                f"omitted.", set_error=False)
-                                    else:
-                                        if _mach_tbl_la['is_rela']:
-                                            _zero(first_widx, num_words)
-                                        _psec = _sec_off(first_widx)
-                                        self.state.elf.relocations.append(
-                                            (sec_name_r, _psec, _pl,
-                                             _ppair[0] if _ppair is not None else _prt,
-                                             _dcst * _scale, num_bytes, 0))
-                                        if _ppair is not None:
-                                            _anc = _elf_anchor_at(self.state, sec_name_r, _psec)
-                                            self.state.elf.relocations.append(
-                                                (sec_name_r, _psec, _anc, _ppair[1], 0, num_bytes, 0))
-                                continue
-                        _dexpr = ''.join(('+' if sg > 0 else '-') + n for sg, n in _dterms)
-                        _dexpr = _dexpr[1:] if _dexpr.startswith('+') else _dexpr
-                        # 緩和しない機種で、全ラベルが 1 つのセクションにあり足す項と引く項の数が同じ差は
-                        # 定数（欄の値のまま。caxx.c の lineassemble() と同じ）。
-                        if not _elf_relaxing(self.state):
-                            _dsecs = set()
-                            _dok = True
-                            for _sg, _n in _dterms:
-                                _dle = self.state.labels.get(_n)
-                                if (_dle is None or (len(_dle) > 3 and _dle[3])
-                                        or not _dle[1]):
-                                    _dok = False
-                                    break
-                                _dsecs.add(_dle[1])
-                            if _dok and len(_dsecs) == 1 and sum(sg for sg, _n in _dterms) == 0:
-                                continue
-                        # `.elfpcguess::1` でその幅の `.elfdiff` が無いとき、「ラベル − いまのセクションの
-                        # ラベル」はその位置からの PC 相対（GNU as と llvm-mc の形）。加数は定数部に
-                        # 「欄の位置 − 引くラベルの位置」を足したもの（caxx.c の lineassemble() と同じ）。
-                        if (_drt is None and len(_dterms) == 2 and _mach_tbl_la['pcrel_guess']):
-                            _pl = next((n for sg, n in _dterms if sg > 0), None)
-                            _pm = next((n for sg, n in _dterms if sg < 0), None)
-                            _mle = self.state.labels.get(_pm) if _pm is not None else None
-                            _mw = None
-                            if (_pl is not None and _mle is not None
-                                    and not (len(_mle) > 3 and _mle[3]) and _mle[1]
-                                    and _mle[1] == sec_name_r
-                                    and _mach_tbl_la['diff'].get(num_bytes) is None):
-                                _mw = self.label_manager._section_relative_offset(
-                                    sec_name_r, int(_mle[0]))
-                            if _mw is not None:
-                                _prt = _src_type(self.state.labels.get(_pl), _pl, num_bytes)
-                                if _prt is None:
-                                    _prt = _reloc_data_pcrel(_mach_tbl_la, num_bytes)
-                                if _prt is None:
-                                    if self.state.debug:
-                                        self.state.diag(
-                                            f" warning - no PC-relative relocation type for a "
-                                            f"{num_bytes}-byte reference to '{_pl}'; relocation "
-                                            f"omitted.", set_error=False)
-                                else:
-                                    _pwo = _completed_words + (self.state.pc + first_widx - _entry_pc_cur)
-                                    if _mach_tbl_la['is_rela']:
-                                        _zero(first_widx, num_words)
-                                    self.state.elf.relocations.append(
-                                        (sec_name_r, _pwo * bpw_r, _pl, _prt,
-                                         (_dcst + (_pwo - _mw)) * _scale, num_bytes, 0))
-                                continue
-                        _dfd = None
-                        if _drt is not None:
-                            _dpair = _mach_tbl_la['diff_t'].get(_drt)
-                            _dfd = _mach_tbl_la['field'].get(_drt)
-                            if _dfd is not None and _dfmask:
-                                _dfd = (_dfmask,) + tuple(_dfd[1:])
-                        else:
-                            _dpair = _mach_tbl_la['diff'].get(num_bytes)
-                        if _dpair is None:
-                            if self.state.debug:
-                                self.state.diag(
-                                    f" warning - no .elfdiff pair for the difference "
-                                    f"'{_dexpr}'; relocation omitted.", set_error=False)
-                            continue
-                        if _drt is not None:
-                            # 型付きの差: 欄は `.elffield` があればその位置と幅、無ければこの参照のワード列。
-                            _dconst = _dcst * _scale
-                            _dw = first_widx + (_dfd[1] // bpw_r if _dfd is not None else 0)
-                            _dnb = (_mach_tbl_la['reloc_bytes'].get(_drt, 0) or num_bytes) \
-                                if _dfd is not None else num_bytes
-                            if _dfd is not None and _mach_tbl_la['is_rela']:
-                                _nw = max(1, _dnb // bpw_r)
-                                if _dw + _nw <= len(objl):
-                                    _clear_mask(_dw, _nw, _dfd[0])
-                        else:
-                            _dconst = (_field_raw(first_widx, num_words) - int(abs_w)) * _scale
-                            _dw = first_widx
-                            _dnb = num_bytes
-                            if _mach_tbl_la['is_rela']:
-                                _zero(first_widx, num_words)
-                        _dsec = _sec_off(_dw)
-                        # 足す項を先に（SET 型のように欄を上書きする足す型が先に効くように）。
-                        _dput = False
-                        _has_plus = any(sg > 0 for sg, _n in _dterms)
-                        _dord = [t for t in _dterms if t[0] > 0] + [t for t in _dterms if t[0] < 0]
-                        for sg, n in _dord:
-                            _da = 0
-                            if not _dput and (sg > 0 or not _has_plus):
-                                _da = _dconst if sg > 0 else -_dconst
-                                _dput = True
-                            self.state.elf.relocations.append(
-                                (sec_name_r, _dsec, n, _dpair[0] if sg > 0 else _dpair[1],
-                                 _da, _dnb, _dfmask if _dfd is not None else 0))
-                        continue
-
-                    _hint = self.state.elf.insn_reloc_hint.get(first_widx)
-                    lentry = self.state.labels.get(lname)
-                    _src_rtype = lentry[4] if (lentry and len(lentry) > 4
-                                               and lentry[4] is not None) else None
-                    _forced_rtype = None
-                    if _hint is not None:
-                        _hint_rtype, _hint_addend, _hint_fmask, _hint_pair = _hint
-                        if _src_rtype is not None and lname not in self.state.extern_untyped:
-                            _hint_rtype = _src_rtype
-                        _fdecl = insn_reloc_field_decl(self.state, _hint_rtype)
-                        # `.reloc` の第 4 欄があれば、その行の欄のマスクはそれ。
-                        if _fdecl is not None and _hint_fmask:
-                            _fdecl = (_hint_fmask,) + tuple(_fdecl[1:])
-                        if _fdecl is None:
-                            _forced_rtype = _hint_rtype
-                        else:
-                            _fmask, _foff, _fsh, _fbias = _fdecl
-                            _insn_bytes = _mach_tbl_la['reloc_bytes'].get(_hint_rtype, 4)
-                            _insn_words = max(1, _insn_bytes // bpw_r)
-                            _fw = first_widx + _foff // bpw_r
-                            # `.elfresolve`: 同じセクションの局所ラベルへの PC 相対の欄は、リンカが書く値
-                            # （ラベル + 加数 + 補正 − 位置）をシフトしてマスクへ詰め、リロケーションは
-                            # 出さない（収まらなければエラー。caxx.c の lineassemble() と同じ）。
-                            if (_mach_tbl_la.get('resolve') and not _elf_relaxing(self.state)
-                                    and _hint_rtype in _mach_tbl_la['resolve']
-                                    and _fw + _insn_words <= len(objl)):
-                                _lw = None
-                                if _local_here(lname):
-                                    _rle = self.state.labels[lname]
-                                    _lw = self.label_manager._section_relative_offset(
-                                        sec_name_r, int(_rle[0]))
-                                    # `.section` の無いソースでは範囲の記録が無いので番地のまま。
-                                    if _lw is None:
-                                        _lw = int(_rle[0])
-                                if _lw is not None:
-                                    _pw = _completed_words + (self.state.pc + _fw - _entry_pc_cur)
-                                    _val = (_lw - _pw) * _scale + _hint_addend * _scale + _fbias
-                                    _sv = _val >> _fsh
-                                    _nb = bin(_fmask).count('1')
-                                    _fits = _nb >= 64 or (-(1 << (_nb - 1)) <= _sv < (1 << (_nb - 1)))
-                                    if 0 < _fsh < 63 and (_val & ((1 << _fsh) - 1)) != 0:
-                                        _fits = False
-                                    if not _fits and self.state.should_report_errors():
-                                        self.state.diag(
-                                            f" error - the reference to '{lname}' resolved in its "
-                                            f"section does not fit the field.  "
-                                            f"[{self.state.current_file}:{self.state.ln}]",
-                                            set_error=True)
-                                    _iv = 0
-                                    for _k in range(_insn_words):
-                                        _iv |= (int(objl[_fw + _k]) & _wm) << _wsh(_k, _insn_words)
-                                    # ビットが並び替わる型（AArch64 の adr、RISC-V の B / J）は `.elfencode`。
-                                    _renc = _mach_tbl_la['encode'].get(_hint_rtype)
-                                    if _renc is not None:
-                                        _rnv = self._elf_call_func('.elfencode', _renc, [_iv, _val])
-                                        if _rnv is not None:
-                                            _iv = int(_rnv)
-                                    else:
-                                        _iv = (_iv & ~_fmask) | _field_deposit(_fmask, _sv)
-                                    for _k in range(_insn_words):
-                                        objl[_fw + _k] = (_iv >> _wsh(_k, _insn_words)) & _wm
-                                    continue
-                            if _fw + _insn_words <= len(objl):
-                                _clear_mask(_fw, _insn_words, _fmask)
-                            _sec_rel_h = _sec_off(_fw)
-                            # 加数は「オペランドの値 − ラベルの値」に補正を足したもの。
-                            self.state.elf.relocations.append(
-                                (sec_name_r, _sec_rel_h, lname, _hint_rtype,
-                                 _hint_addend * _scale + _fbias, _insn_bytes, _hint_fmask))
-                            # `.reloc` の追加の再配置（同じシンボルと加数。`.elfanchor` の型はこの位置の
-                            # アンカーを指し、加数は補正だけ）。
-                            for _prt_p, _poff_p in (_hint_pair or ()):
-                                _pfd = insn_reloc_field_decl(self.state, _prt_p)
-                                if _pfd is None:
-                                    continue
-                                _pbytes = _mach_tbl_la['reloc_bytes'].get(_prt_p, 0) or 4
-                                _pwords = max(1, _pbytes // bpw_r)
-                                _pw = first_widx + _poff_p // bpw_r
-                                if _pw + _pwords > len(objl):
-                                    continue
-                                if _mach_tbl_la['is_rela']:
-                                    _clear_mask(_pw, _pwords, _pfd[0])
-                                _panc = _prt_p in _mach_tbl_la.get('anchor', ())
-                                _psym = (_elf_anchor_at(self.state, sec_name_r, _sec_rel_h)
-                                         if _panc else lname)
-                                _psec_p = _sec_off(_pw)
-                                self.state.elf.relocations.append(
-                                    (sec_name_r, _psec_p, _psym, _prt_p,
-                                     (0 if _panc else _hint_addend * _scale) + _pfd[3],
-                                     _pbytes, 0))
-                            continue
-
-                    rtype = 0
-                    _rtype_is_default_guess = False
-                    # `.reloctype` はその幅の推測の型（型を書かない `.extern` の既定の型も）を上書きし、
-                    # 上書きした型は絶対／PC 相対の選び直しにかけない（caxx.c と同じ）。
-                    _rt_src_ovr = self.state.elf.reloctype_override.get(num_bytes)
-                    if _forced_rtype is not None:
-                        rtype = _forced_rtype
-                    elif (_src_rtype is not None
-                          and not (_rt_src_ovr is not None and lname in self.state.extern_untyped)):
-                        rtype_override = _src_rtype
-                        expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
-                        if expected is None or expected == num_bytes:
-                            rtype = rtype_override
-                        else:
-                            rtype = _rmap.get(num_bytes, 0)
-                            _rtype_is_default_guess = _rt_src_ovr is None
-                    else:
-                        rtype = _rmap.get(num_bytes, 0)
-                        _rtype_is_default_guess = _rt_src_ovr is None
-                    # `.db` などの欄は式の値そのものなので、推測の型は同じ幅の絶対型にする（x86-64 の
-                    # 4 バイトの推測は rel32 向けの PC 相対のため）。caxx.c の lineassemble() と同じ。
-                    if (first_widx in self.state._elf_data_fields
-                            and _forced_rtype is None and _rt_src_ovr is None
-                            and (_src_rtype is None or lname in self.state.extern_untyped)):
-                        _dabs = _reloc_same_width(_mach_tbl_la, num_bytes, False)
-                        if _dabs is not None:
-                            rtype = _dabs
-                            _rtype_is_default_guess = False
-
-                    if first_widx >= len(objl):
-                        continue
-                    if rtype == 0:
-                        # `.db` などの行では -d が無くても知らせる（caxx.c と同じ）。
-                        if self.state.debug or self.state._data_dir_line:
-                            self.state.diag(
-                                f" warning - no relocation type available for a {num_bytes}-byte "
-                                f"reference to '{lname}'; relocation omitted.", set_error=False)
-                        continue
-
-                    sec_rel = _sec_off(first_widx)
-                    raw_val = 0
-                    for k in range(num_words):
-                        if first_widx + k < len(objl):
-                            if _little:
-                                raw_val |= (int(objl[first_widx + k]) & _wm) << (_bts * k)
-                            else:
-                                raw_val = (raw_val << _bts) | (int(objl[first_widx + k]) & _wm)
-
-                    if (isinstance(abs_w, float) and not math.isfinite(abs_w)) or \
-                       _is_undef_derived(abs_w):
-                        continue
-
-                    _field_bits = num_words * self.state.bts
-                    if _field_bits > 0 and raw_val >= (1 << (_field_bits - 1)):
-                        raw_val -= (1 << _field_bits)
-
-                    abs_wi = int(abs_w)
-
-                    if (_rtype_is_default_guess and rtype in _pc_rel_types_all
-                            and raw_val == abs_wi):
-                        _alt = _reloc_same_width(_mach_tbl_la, num_bytes, False)
-                        if _alt is not None:
-                            rtype = _alt
-
-                    # 欄がオペランドの値（ラベル＋綴りの定数）を持たなければ、パターンが変位を計算した
-                    # として PC 相対の型にする（欄の幅のビットで比べる）。caxx.c の lineassemble() と同じ。
-                    _pcg_d = raw_val - (abs_wi + self.state.elf.insn_reloc_hint.get(
-                        ('v', first_widx), 0))
-                    if 0 < _field_bits < 64:
-                        _pcg_d &= (1 << _field_bits) - 1
-                    if (_rtype_is_default_guess and _mach_tbl_la['pcrel_guess']
-                            and rtype not in _pc_rel_types_all
-                            and _pcg_d != 0):
-                        _alt = _reloc_data_pcrel(_mach_tbl_la, num_bytes)
-                        if _alt is not None:
-                            rtype = _alt
-
-                    # `.elfunaligned`: 位置が欄の幅の倍数でなければその型（SPARC の UA64。llvm-mc と同じ）。
-                    _ua = _mach_tbl_la.get('unaligned', {}).get(rtype)
-                    if _ua is not None and num_bytes > 0 and sec_rel % num_bytes != 0:
-                        rtype = _ua
-
-                    # `.elfresolve`: この型が同じセクションの局所ラベルを指すなら、欄はパターンが
-                    # 書いたまま（-b と同じ計算）でリロケーションは出さない（緩和する機種は除く）。
-                    # `.elffield` の無い型（x86-64 の pc32 など）はここで見る。caxx.c と同じ。
-                    if (_mach_tbl_la.get('resolve') and not _elf_relaxing(self.state)
-                            and rtype in _mach_tbl_la['resolve'] and _local_here(lname)):
-                        continue
-
-                    # 加数はワードで求めてから単位（.elfunit）に直す。
-                    if rtype in _pc_rel_types_all:
-                        _P_adj = self.label_manager._section_relative_offset(
-                            self.state.current_section, self.state.pc + first_widx)
-                        _P_w = _P_adj if _P_adj is not None else self.state.pc + first_widx
-                        # 欄は幅で切られているので、綴りの定数を除いた部分（位置と変位の基点の差）を
-                        # 欄の幅で符号付きに折り返す（caxx.c の lineassemble() と同じ）。
-                        _cst = self.state.elf.insn_reloc_hint.get(('v', first_widx), 0)
-                        _pd = raw_val - abs_wi + _P_w - _cst
-                        if 0 < _field_bits < 64:
-                            _pd &= (1 << _field_bits) - 1
-                            if _pd >= (1 << (_field_bits - 1)):
-                                _pd -= 1 << _field_bits
-                        addend = (_cst + _pd) * _scale
-                    else:
-                        addend = (raw_val - abs_wi) * _scale
-
-                    # REL では書き出しのときに加数を欄へ書き戻す。
-                    if _mach_tbl_la['is_rela']:
-                        _zero(first_widx, num_words)
-                    self.state.elf.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes, 0))
-
-            if self.state.elf.gen_debug and self.state.relax.pas == 2 and of > 0:
-                self.state.elf.line_map.append(
-                    (self.state.current_section, self.state.pc,
-                     self.state.current_file, self.state.ln))
+            if st.elf.gen_debug and st.relax.pas == 2 and of > 0:
+                st.elf.line_map.append(
+                    (st.current_section, st.pc,
+                     st.current_file, st.ln))
 
             for cnt in range(of):
-                self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
-            self.state.pc += of
+                self.binary_writer.outbin(st.pc + cnt, objl[cnt])
+            st.pc += of
         else:
             vflag = False
             try:
                 vflag = self.vliw_proc.vliwprocess(line, idxs, objl, flag, idx, self.lineassemble2)
             except Exception as _vliw_exc:
-                if self.state.should_report_errors():
-                    self.state.diag(" error - Some error(s) in vliw definition.", set_error=True)
+                if st.should_report_errors():
+                    st.diag(" error - Some error(s) in vliw definition.", set_error=True)
 
-                    if self.state.verbose or self.state.debug:
+                    if st.verbose or st.debug:
                         print(f"   ({type(_vliw_exc).__name__}: {_vliw_exc})", file=sys.stderr)
             return vflag
 
         return True
+
+    def _line_relocations(self, objl):
+        """この行のワード列 objl に、-o のリロケーションを付ける（_LineRelocs）。"""
+        _LineRelocs(self, objl).run()
+
+    def _textmode_decorate(self, objl):
+        """`.textmode` で、行のラベル・コメント・字下げの綴りをワード列の前後に足す。"""
+        st = self.state
+        if st.label_text and (st.asmtext is not None or not objl):
+            _lpfx = st.label_text
+            _ltxt = st.asmtext
+            if _ltxt:
+                _lpfx += ' '
+            _lbytes = list(_lpfx.encode('utf-8', errors='surrogateescape'))
+            objl[0:0] = _lbytes
+            st.asmtext = _lpfx + (_ltxt or '')
+            st.asmtext_disp = '"%s"' % asmtext_escaped(st.asmtext)
+            self._shift_refs(len(_lbytes))
+
+        if st.comment_text and (st.asmtext is not None or not objl):
+            _ctxt = st.comment_text
+            _cur = st.asmtext or ''
+            _csfx = (' ' + _ctxt) if _cur else _ctxt
+            objl.extend(self._text_words(_csfx))
+            st.asmtext = _cur + _csfx
+            st.asmtext_disp = '"%s"' % asmtext_escaped(st.asmtext)
+
+        if st.indent_text and st.asmtext:
+            _itxt = st.indent_text
+            _ibytes = list(_itxt.encode('utf-8', errors='surrogateescape'))
+            objl[0:0] = _ibytes
+            st.asmtext = _itxt + st.asmtext
+            st.asmtext_disp = '"%s"' % asmtext_escaped(st.asmtext)
+            self._shift_refs(len(_ibytes))
 
     def _shift_refs(self, n):
         """行の頭に n ワード足したぶん、積んだラベル参照のワード位置をずらす。"""
@@ -11574,51 +11578,45 @@ class Assembler:
 
     def lineassemble0(self, line):
         """1 行を処理する外枠。行の前処理と診断の文脈を整える。"""
-        self.state._diag_line_seen.clear()
+        st = self.state
+        st._diag_line_seen.clear()
         cleaned = line.replace('\n', '').replace('\r', '')
-        _show = (self.state.relax.pas == 2 and self.state.verbose) or self.state.relax.pas == 0
+        _show = (st.relax.pas == 2 and st.verbose) or st.relax.pas == 0
         if _show:
             # 外側の行（.include）の一覧が閉じていなければここで改行する（caxx.c の listing_open）。
-            if self.state._listing_open:
+            if st._listing_open:
                 print("")
-            self.state.cl = cleaned
-            print("%016x " % self.state.pc, end='')
-            print(f"{self.state.current_file} {self.state.ln} {self.state.cl} //", end='')
-            self.state._listing_open = True
-        self.state.asmtext = None
-        self.state.asmtext_disp = None
+            st.cl = cleaned
+            print("%016x " % st.pc, end='')
+            print(f"{st.current_file} {st.ln} {st.cl} //", end='')
+            st._listing_open = True
+        st.asmtext = None
+        st.asmtext_disp = None
         f = self.lineassemble(cleaned)
         # `.textmode` の -V は、-b に書いたバイト列をそのまま標準出力に出す（.emit の分も）。
         _tb = self.binary_writer.text_bytes
         if _tb:
             sys.stdout.write(bytes(_tb).decode('utf-8', 'surrogateescape'))
             _tb.clear()
-        if self.state.asmtext is not None and self.state.relax.pas in (0, 2):
+        if st.asmtext is not None and st.relax.pas in (0, 2):
             if _show:
-                print(' %s' % (self.state.asmtext_disp or ''), end='')
-            elif self.state.text_output and not self.state.textmode:
-                print(self.state.asmtext)
-        self.state.asmtext = None
-        self.state.asmtext_disp = None
-        if _show and self.state._listing_open:
+                print(' %s' % (st.asmtext_disp or ''), end='')
+            elif st.text_output and not st.textmode:
+                print(st.asmtext)
+        st.asmtext = None
+        st.asmtext_disp = None
+        if _show and st._listing_open:
             print("")
         if _show:
-            self.state._listing_open = False
-        self.state.ln += 1
+            st._listing_open = False
+        st.ln += 1
         return f
-
-    _ELF_DECLS = ('.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth', '.elfextern',
-                  '.elfdwarf', '.elfheader', '.elfsection', '.elffield', '.elfpcguess', '.elfrelax',
-                  '.elfanchor', '.elfresolve', '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
-                  '.elfrinfo', '.elfunit', '.elflink', '.elfgroup', '.elfcfi', '.elfcfiinit',
-                  '.elfcfireg', '.elfunaligned')
 
     def register_elfdecls(self, pat):
         """パターンファイル中の ELF 記述ディレクティブを先に読んでおく。"""
-        table = {n: getattr(self.directive_proc, n[1:] + '_processing') for n in self._ELF_DECLS}
         for i in pat:
-            if i and i[0] in table:
-                table[i[0]](i)
+            if i and i[0] in _ELF_DECLS:
+                getattr(self.directive_proc, _PAT_DIRECTIVE_HANDLERS[i[0]])(i)
         self.check_elfdecls()
 
     def elf_desc_text(self):
@@ -11763,13 +11761,7 @@ class Assembler:
                     key = StringUtils.upper(i[1])
                     st.symbols = dict(fresh)
                     value_field = i[2] if len(i) >= 3 else ''
-                    vf = value_field.lstrip(' \t')
-                    if vf.startswith('"'):
-                        st.strsymbols[key] = ObjectGenerator._txt_template_inner(vf)
-                    elif vf.startswith('['):
-                        st.arrsymbols[key] = arr_items_from_text(self.expr_eval, vf)
-                    elif not (symbol_copy_from_name(st, key, vf)
-                              or symbol_set_from_text(st, key, value_field)):
+                    if not self.directive_proc._setsym_special(key, value_field, bump=False):
                         fresh[key] = self.expr_eval.expression_pat(value_field, 0)[0] if value_field else 0
                 elif len(i) >= 3 and i[2]:
                     fresh[StringUtils.upper(i[2])] = 0
@@ -11951,7 +11943,6 @@ class Assembler:
                  f"Skipping debug sections.", set_error=False)
             return [], []
 
-        _struct = struct
         _pk = '<' if self.state.endian != 'big' else '>'
 
         is_elf64_dw = (_eff_class_dw == 2)
@@ -11959,7 +11950,7 @@ class Assembler:
         is_rela_dw = _mach_tbl_dw.get('is_rela', True)
 
         def _pack_addr(v):
-            return _struct.pack(_pk + ('I' if addr_sz == 4 else 'Q'), v & ((1 << (addr_sz * 8)) - 1))
+            return struct.pack(_pk + ('I' if addr_sz == 4 else 'Q'), v & ((1 << (addr_sz * 8)) - 1))
 
         abs64 = _mach_tbl_dw['dwarf_abs']
         if _mach_tbl_dw['reloc_bytes'].get(abs64) != addr_sz:
@@ -12004,7 +11995,7 @@ class Assembler:
         _dbg_labels = []
         for _name, *_rest in sorted(self.state.labels.items()):
             _entry = _rest[0]
-            if (len(_entry) > 2 and _entry[2]) or (len(_entry) > 3 and _entry[3]):
+            if _entry[2] or _entry[3]:
                 continue
             try:
                 _byte_addr = int(_entry[0]) * bpw
@@ -12050,14 +12041,14 @@ class Assembler:
         die = bytearray()
         die += _uleb(1)
         die += producer.encode() + b'\x00'
-        die += _struct.pack(f'{_pk}H', 0x8001)
+        die += struct.pack(f'{_pk}H', 0x8001)
         die += cu_name.encode() + b'\x00'
         die += comp_dir.encode() + b'\x00'
         if primary_idx:
             info_relas.append((len(die), primary_idx, abs64, 0))
         die += _pack_addr(0)
-        die += _struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
-        die += _struct.pack(f'{_pk}I', 0)
+        die += struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
+        die += struct.pack(f'{_pk}I', 0)
         for name, sidx, off in _dbg_labels:
             die += _uleb(2)
             die += name.encode() + b'\x00'
@@ -12066,11 +12057,11 @@ class Assembler:
         if _dbg_labels:
             die += _uleb(0)
 
-        info_body = (_struct.pack(f'{_pk}H', 4)
-                     + _struct.pack(f'{_pk}I', 0)
+        info_body = (struct.pack(f'{_pk}H', 4)
+                     + struct.pack(f'{_pk}I', 0)
                      + bytes([addr_sz])
                      + bytes(die))
-        debug_info = _struct.pack(f'{_pk}I', len(info_body)) + info_body
+        debug_info = struct.pack(f'{_pk}I', len(info_body)) + info_body
         _info_prefix = 4 + 2 + 4 + 1
         info_relas = [(_info_prefix + o, s, t, a) for (o, s, t, a) in info_relas]
 
@@ -12089,8 +12080,7 @@ class Assembler:
             hbody += fn.encode() + b'\x00' + _uleb(0) + _uleb(0) + _uleb(0)
         hbody += b'\x00'
 
-        from collections import defaultdict as _dd
-        rows_by_sec = _dd(list)
+        rows_by_sec = defaultdict(list)
         for (sec, wpc, fn, ln) in line_map:
             sidx = sec_name_to_idx.get(sec)
             if sidx is None:
@@ -12132,11 +12122,11 @@ class Assembler:
                 prog += bytes([2]) + _uleb(end_off - cur_off)
             prog += b'\x00' + _uleb(1) + b'\x01'
 
-        line_body = (_struct.pack(f'{_pk}H', 4)
-                     + _struct.pack(f'{_pk}I', len(hbody))
+        line_body = (struct.pack(f'{_pk}H', 4)
+                     + struct.pack(f'{_pk}I', len(hbody))
                      + bytes(hbody)
                      + bytes(prog))
-        debug_line = _struct.pack(f'{_pk}I', len(line_body)) + line_body
+        debug_line = struct.pack(f'{_pk}I', len(line_body)) + line_body
 
         def _pack_dbg_relocs(entries):
             out = bytearray()
@@ -12146,9 +12136,9 @@ class Assembler:
                 r_info = self._elf_r_info(sym, rtype, is_elf64_dw)
                 if is_rela_dw:
                     a = min((1 << bits) - 1, max(-(1 << bits), addend))
-                    out += _struct.pack(fmt + ('q' if is_elf64_dw else 'i'), off, r_info, a)
+                    out += struct.pack(fmt + ('q' if is_elf64_dw else 'i'), off, r_info, a)
                 else:
-                    out += _struct.pack(fmt, off, r_info)
+                    out += struct.pack(fmt, off, r_info)
             return bytes(out)
 
         prog_sections = [
@@ -12432,175 +12422,172 @@ class Assembler:
             return (sym << 32) | (rtype & 0xffffffff)
         return ((sym & 0xffffff) << 8) | (rtype & 0xff)
 
+    class _CSec:
+        """ELF へ書くセクション 1 つぶん（名前・位置・中身・属性）。"""
+        __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags',
+                     'sh_type', 'align', 'entsize')
+
+        def __init__(self, name, byte_start, data, flags, sh_type, align, entsize):
+            self.name = name
+            self.byte_start = byte_start
+            self.data = data
+            self.byte_size = len(data)
+            self.flags = flags
+            self.sh_type = sh_type
+            self.align = align
+            self.entsize = entsize
+
+    # 中身の大きさに -b と同じ上限を置く（caxx.c の write_elf_obj() と同じ数え方）。
+    _MAX_OUTPUT_BYTES = 1 << 30
+
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
         """ELF 再配置可能オブジェクトを書く（セクション・シンボル表・リロケーション、-g なら DWARF）。
 
         マシン記述は elf_machine_table() の実表から取る。型の決まらない参照はリロケーションを出さない。
+        仕事は段ごとのメソッドに分け、共有する値は w（SimpleNamespace）に持つ。
         """
-        import struct as _struct
+        w = self._elf_begin(machine)
+        if not self._elf_sections(w):
+            return
+        self._elf_relocs(w)
+        self._elf_groups(w)
+        w.dbg_prog, w.dbg_rela = self._build_dwarf_sections(w.csecs, w.sec_name_to_idx, w.bpw, machine)
+        self._elf_names(w)
+        self._elf_symbols(w)
+        self._elf_reloc_data(w)
+        self._elf_layout(w)
+        if not self._elf_write(w, path, machine):
+            return
+        _dbg_msg = f", {len(w.dbg_prog)} debug section(s)" if w.dbg_prog else ""
+        _reloc_kind = "rela" if w.is_rela else "rel"
+        print(f"elf: wrote {path} ({w.ncs} section(s), {w.nrela} {_reloc_kind} section(s), "
+              f"{len(w.syms)} symbol(s){_dbg_msg})",
+              file=sys.stderr)
 
-        bpw = max(1, (self.state.bts + 7) // 8)
-        buf = self.binary_writer._buffer
-
-        _is_le    = (self.state.endian != 'big')
-        _ei_data  = 1 if _is_le else 2
-        _pk       = '<' if _is_le else '>'
-
-        _mach_tbl_w = elf_machine_table(self.state)
-        _native_elfclass = _mach_tbl_w['elfclass']
-        _elfclass  = self.state.elf.elf_class or _native_elfclass
+    def _elf_begin(self, machine):
+        """ELF の形を決める（クラス・バイト順・ヘッダの欄）。"""
+        st = self.state
+        w = SimpleNamespace()
+        w.bpw = max(1, (st.bts + 7) // 8)
+        w.buf = self.binary_writer._buffer
+        w.is_le = (st.endian != 'big')
+        w.pk = '<' if w.is_le else '>'
+        w.order = 'little' if st.endian == 'little' else 'big'
+        w.mach = elf_machine_table(st)
+        _native_elfclass = w.mach['elfclass']
+        _elfclass = st.elf.elf_class or _native_elfclass
         if _elfclass != _native_elfclass:
-            self.state.diag(
+            st.diag(
                 f" warning - -f forced ELF{'64' if _elfclass == 2 else '32'} for "
                 f"machine {machine}, whose conventional class is "
                 f"ELF{'64' if _native_elfclass == 2 else '32'}; writing a "
                 f"non-default (but well-formed) combination.",
                 set_error=False)
-        _is_elf64  = (_elfclass == 2)
-        _ehdr_size = 64 if _is_elf64 else 52
-        _word_mask = 0xFFFFFFFFFFFFFFFF if _is_elf64 else 0xFFFFFFFF
+        w.is_elf64 = (_elfclass == 2)
+        w.is_rela = w.mach['is_rela']
+        w.ehdr_size = 64 if w.is_elf64 else 52
+        w.word_mask = 0xFFFFFFFFFFFFFFFF if w.is_elf64 else 0xFFFFFFFF
+        w.hdr = st.elf.decl_hdr
+        w.word_align = 8 if w.is_elf64 else 4
+        w.sym_entsize = 24 if w.is_elf64 else 16
+        w.rela_sh_type = 4 if w.is_rela else 9
+        w.rel_entsize = (24 if w.is_elf64 else 12) if w.is_rela else (16 if w.is_elf64 else 8)
+        w.rela_prefix = '.rela' if w.is_rela else '.rel'
+        # `.elfunit::word` ならシンボルの値と大きさはワード単位で書く。
+        w.word_unit = (w.mach['unit'] == 'word')
+        w.bpw_sym = 1 if w.word_unit else w.bpw
+        return w
 
-        _hdr        = self.state.elf.decl_hdr
-        _e_flags    = _hdr.get('flags', 0) & 0xFFFFFFFF
-        _e_version  = _hdr.get('version', 1) & 0xFFFFFFFF
-        _e_entry    = _hdr.get('entry', 0) & _word_mask
-        _ei_osabi   = _hdr.get('osabi', self.state.elf.osabi) & 0xFF
-        _ei_abiver  = _hdr.get('abiversion', 0) & 0xFF
+    def _elf_extract(self, w, w_start, w_count):
+        """ワード w_start から w_count 個を、隙間は `.padding` で埋めたバイト列にする。"""
+        bpw = w.bpw
+        if w_count * bpw == 0:
+            return b''
+        pad = int(self.state.padding) & ((1 << self.state.bts) - 1)
+        data = bytearray(pad.to_bytes(bpw, w.order) * w_count if pad else w_count * bpw)
+        for pos, val in w.buf.items():
+            if w_start <= pos < w_start + w_count:
+                off = (pos - w_start) * bpw
+                data[off:off + bpw] = (val & ((1 << (8 * bpw)) - 1)).to_bytes(bpw, w.order)
+        return bytes(data)
 
-        def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
-            e_type = _hdr.get('type', e_type) & 0xFFFF
-            ident = (b'\x7fELF'
-                     + bytes([2 if _is_elf64 else 1, _ei_data, 1, _ei_osabi, _ei_abiver])
-                     + b'\x00' * 7)
-            # e_phoff は 0、プログラムヘッダは無い。e_shentsize は 64 / 40。
-            return ident + _struct.pack(_pk + ('HHIQQQIHHHHHH' if _is_elf64 else 'HHIIIIIHHHHHH'),
-                                        e_type, e_machine, _e_version, _e_entry, 0, e_shoff,
-                                        _e_flags, _ehdr_size, 0, 0, 64 if _is_elf64 else 40,
-                                        e_shnum, e_shstrndx)
-
-        def _pack_shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset,
-                       sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
-            return _struct.pack(_pk + ('IIQQQQIIQQ' if _is_elf64 else 'IIIIIIIIII'),
-                                sh_name, sh_type, sh_flags, sh_addr, sh_offset,
-                                sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
-
-        def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
-            st_value &= _word_mask
-            st_size  &= _word_mask
-            if _is_elf64:
-                return _struct.pack(f'{_pk}IBBHQQ',
-                    st_name, st_info, st_other, st_shndx, st_value, st_size)
-            return _struct.pack(f'{_pk}IIIBBH',
-                st_name, st_value, st_size, st_info, st_other, st_shndx)
-
-        def _align_up(x, a):
-            return (x + a - 1) & ~(a - 1)
-
-        _order = 'little' if self.state.endian == 'little' else 'big'
-
-        def _extract(w_start, w_count):
-            # ワード w_start から w_count 個を、隙間は `.padding` で埋めたバイト列にする。
-            if w_count * bpw == 0:
-                return b''
-            pad = int(self.state.padding) & ((1 << self.state.bts) - 1)
-            data = bytearray(pad.to_bytes(bpw, _order) * w_count if pad else w_count * bpw)
-            for pos, val in buf.items():
-                if w_start <= pos < w_start + w_count:
-                    off = (pos - w_start) * bpw
-                    data[off:off + bpw] = (val & ((1 << (8 * bpw)) - 1)).to_bytes(bpw, _order)
-            return bytes(data)
-
-        class _CSec:
-            """ELF へ書くセクション 1 つぶん（名前・位置・中身・属性）。"""
-            __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags',
-                         'sh_type', 'align', 'entsize')
-
-            def __init__(self, name, byte_start, data, flags, sh_type, align,
-                         entsize):
-                self.name       = name
-                self.byte_start = byte_start
-                self.data       = data
-                self.byte_size  = len(data)
-                self.flags      = flags
-                self.sh_type    = sh_type
-                self.align      = align
-                self.entsize    = entsize
-
-        # 中身の大きさに -b と同じ上限を置く（caxx.c の write_elf_obj() と同じ数え方）。
-        _MAX_OUTPUT_BYTES = 1 << 30
+    def _elf_sections(self, w):
+        """出力するセクション（csecs）を集める。大きすぎれば診断して偽。"""
+        st = self.state
+        bpw = w.bpw
+        buf = w.buf
         # .section を使わないとき、暗黙の .text は語 0 から最後の位置カウンタまで（末尾の .org で
         # 進めた分も入れる。caxx.c の write_elf_obj() の _end_w と同じ）。
-        _end_w = self.state.pc if isinstance(self.state.pc, int) and self.state.pc > 0 else 0
-        if self.state.sections:
-            _tot_w = sum(rl for _sn in self.state.sections
-                         for _rs, rl in self._section_word_ranges(_sn))
+        _end_w = st.pc if isinstance(st.pc, int) and st.pc > 0 else 0
+        if st.sections:
+            _tot_w = sum(rl for _sn in st.sections for _rs, rl in self._section_word_ranges(_sn))
         else:
             _tot_w = max(max(buf.keys(), default=-1) + 1, _end_w)
-        if _tot_w * bpw > _MAX_OUTPUT_BYTES:
-            self.state.diag(f" error - output size {_tot_w * bpw} bytes exceeds maximum "
-                            f"{_MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
-                            f"values.", set_error=True, force=True)
-            return
+        if _tot_w * bpw > self._MAX_OUTPUT_BYTES:
+            st.diag(f" error - output size {_tot_w * bpw} bytes exceeds maximum "
+                    f"{self._MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
+                    f"values.", set_error=True, force=True)
+            return False
 
         csecs = []
         max_w = max(buf.keys(), default=-1)
-
-        if not self.state.sections:
+        if not st.sections:
             w_count = max(max_w + 1 if max_w >= 0 else 0, _end_w)
-            _fl0, _sht0, _al0, _es0 = _elf_section_attrs(self.state, '.text')
-            csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0,
-                               _al0, _es0))
+            _fl0, _sht0, _al0, _es0 = _elf_section_attrs(st, '.text')
+            csecs.append(self._CSec('.text', 0, self._elf_extract(w, 0, w_count), _fl0, _sht0,
+                                    _al0, _es0))
         else:
-            sec_names = list(self.state.sections.keys())
-            for i, sname in enumerate(sec_names):
-
+            for sname in list(st.sections.keys()):
                 ranges = self._section_word_ranges(sname)
-                w0 = ranges[0][0] if ranges else self.state.sections[sname][0]
-                byte_start = w0 * bpw
-                data = b''.join(_extract(rs, rl) for rs, rl in ranges)
-                flags, _sht, _al, _es = _elf_section_attrs(self.state, sname)
-                csecs.append(_CSec(sname, byte_start, data, flags, _sht, _al, _es))
+                w0 = ranges[0][0] if ranges else st.sections[sname][0]
+                data = b''.join(self._elf_extract(w, rs, rl) for rs, rl in ranges)
+                flags, _sht, _al, _es = _elf_section_attrs(st, sname)
+                csecs.append(self._CSec(sname, w0 * bpw, data, flags, _sht, _al, _es))
+        w.csecs = csecs
+        w.ncs = len(csecs)
+        w.sec_name_to_idx = {s.name: i + 1 for i, s in enumerate(csecs)}
+        return True
 
-        ncs = len(csecs)
-
-        sec_name_to_idx = {s.name: i + 1 for i, s in enumerate(csecs)}
-
-        _is_rela = _mach_tbl_w['is_rela']
-
-        from collections import defaultdict as _defaultdict
-        rela_entries = _defaultdict(list)
-        _extra_w = _mach_tbl_w['extra']
-        for (sname, off, sym_name, rtype, addend, nbytes, fmask) in self.state.elf.relocations:
-            sidx = sec_name_to_idx.get(sname, 0)
+    def _elf_relocs(self, w):
+        """リロケーションをセクションごとに集め、REL なら加数を欄へ書き戻す。"""
+        st = self.state
+        bpw = w.bpw
+        csecs = w.csecs
+        rela_entries = defaultdict(list)
+        _extra_w = w.mach['extra']
+        for (sname, off, sym_name, rtype, addend, nbytes, fmask) in st.elf.relocations:
+            sidx = w.sec_name_to_idx.get(sname, 0)
             if sidx:
                 rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes, fmask))
                 # `.elfextra` の添えるリロケーション。同じ位置、加数 0。
                 for (_crt, _csym) in _extra_w.get(rtype, ()):
                     rela_entries[sidx].append(
                         (off, sym_name if _csym else None, _crt, 0, nbytes, 0))
-            else:
-                if self.state.should_report_errors():
-                    self.state.diag(
-                        f" error - relocation references unknown section '{sname}'; dropped from output.",
+            elif st.should_report_errors():
+                st.diag(f" error - relocation references unknown section '{sname}'; dropped from output.",
                         set_error=True)
 
-        if not _is_rela:
-            _wmask_r = (1 << self.state.bts) - 1
-            _enc_w = _mach_tbl_w['encode']
+        if not w.is_rela:
+            _wmask_r = (1 << st.bts) - 1
+            _enc_w = w.mach['encode']
+
+            def _wsh(k, nw):
+                return st.bts * (k if w.is_le else (nw - 1 - k))
 
             def _rd_field(patched, off, nw):
                 # 欄の nw ワードを 1 つの値に読む。
                 v = 0
                 for k in range(nw):
-                    w = int.from_bytes(patched[off + k * bpw: off + (k + 1) * bpw], _order)
-                    v |= (w & _wmask_r) << (self.state.bts * (k if _is_le else (nw - 1 - k)))
+                    v |= (int.from_bytes(patched[off + k * bpw: off + (k + 1) * bpw], w.order)
+                          & _wmask_r) << _wsh(k, nw)
                 return v
 
             def _wr_field(patched, off, nw, v):
                 # 値を欄の nw ワードへ書き戻す。
                 for k in range(nw):
-                    w = (v >> (self.state.bts * (k if _is_le else (nw - 1 - k)))) & _wmask_r
-                    patched[off + k * bpw: off + (k + 1) * bpw] = w.to_bytes(bpw, _order)
+                    patched[off + k * bpw: off + (k + 1) * bpw] = \
+                        ((v >> _wsh(k, nw)) & _wmask_r).to_bytes(bpw, w.order)
+
             for sidx, entries in rela_entries.items():
                 csec = csecs[sidx - 1]
                 patched = bytearray(csec.data)
@@ -12611,7 +12598,7 @@ class Assembler:
                     if off in _written:
                         continue
                     _written.add(off)
-                    _fd = _mach_tbl_w['field'].get(_rtype)
+                    _fd = w.mach['field'].get(_rtype)
                     if _fd is not None and _fmask:
                         _fd = (_fmask,) + tuple(_fd[1:])
                     _enc = _enc_w.get(_rtype)
@@ -12632,73 +12619,100 @@ class Assembler:
                         continue
                     if 0 <= off and off + nbytes <= len(patched):
                         patched[off:off + nbytes] = \
-                            (addend & ((1 << (nbytes * 8)) - 1)).to_bytes(nbytes, _order)
+                            (addend & ((1 << (nbytes * 8)) - 1)).to_bytes(nbytes, w.order)
                 csec.data = bytes(patched)
 
-        rela_sec_order = [i + 1 for i, s in enumerate(csecs) if (i + 1) in rela_entries]
-        nrela = len(rela_sec_order)
+        w.rela_entries = rela_entries
+        w.rela_sec_order = [i + 1 for i in range(len(csecs)) if (i + 1) in rela_entries]
+        w.nrela = len(w.rela_sec_order)
 
-        # `.elfgroup` のグループのセクションはメンバーより前に要る（gABI）ので、セクション
-        # ヘッダ表の先頭に置き、残りの番号を G だけずらす。
+    def _elf_groups(self, w):
+        """`.elfgroup` のグループ（SHT_GROUP）。メンバーより前に要る（gABI）ので、セクション
+        ヘッダ表の先頭に置き、残りの番号を G だけずらす。"""
+        st = self.state
+        csecs = w.csecs
         _groups = []
-        for (_gn, _gsig, _gfl, _gmem) in self.state.elf.decl_group.values():
+        for (_gn, _gsig, _gfl, _gmem) in st.elf.decl_group.values():
             _nums = []
             for _m in _gmem:
                 _k = next((i + 1 for i, cs in enumerate(csecs)
                            if cs.name.translate(_ALOWER) == _m.translate(_ALOWER)), None)
                 if _k is None:
-                    self.state.diag(f" warning - .elfgroup: member section '{_m}' of group "
-                                    f"'{_gn}' is not in the output; ignored.", set_error=False)
+                    st.diag(f" warning - .elfgroup: member section '{_m}' of group "
+                            f"'{_gn}' is not in the output; ignored.", set_error=False)
                 elif _k not in _nums:
                     _nums.append(_k)
             if _nums:
                 _groups.append((_gn, _gsig, _gfl, _nums))
             else:
-                self.state.diag(f" warning - .elfgroup: group '{_gn}' has no member in the "
-                                f"output; not written.", set_error=False)
-        G = len(_groups)
-        _grp_members = set()
+                st.diag(f" warning - .elfgroup: group '{_gn}' has no member in the "
+                        f"output; not written.", set_error=False)
+        w.groups = _groups
+        w.G = len(_groups)
+        w.grp_members = set()
         for (_gn, _gsig, _gfl, _nums) in _groups:
             for _k in _nums:
                 csecs[_k - 1].flags |= 0x200
-                _grp_members.add(_k)
+                w.grp_members.add(_k)
 
-        dbg_prog, dbg_rela = self._build_dwarf_sections(
-            csecs, sec_name_to_idx, bpw, machine)
-
+    def _elf_names(self, w):
+        """セクション名の文字列表（.shstrtab）と各名前の位置。"""
+        st = self.state
         shstrtab = bytearray(b'\x00')
 
         def _shname(nm):
             off = len(shstrtab)
             shstrtab.extend(nm.encode() + b'\x00')
             return off
-        _rela_prefix = '.rela' if _is_rela else '.rel'
-        sec_name_offs = [_shname(s.name) for s in csecs]
-        rela_name_offs = [_shname(_rela_prefix + csecs[sidx - 1].name) for sidx in rela_sec_order]
-        symtab_name_off = _shname('.symtab')
-        strtab_name_off = _shname('.strtab')
-        shstrtab_name_off = _shname('.shstrtab')
-        dbg_prog_name_offs = [_shname(dname) for (dname, _ddata) in dbg_prog]
-        dbg_rela_name_offs = [_shname(rname) for (rname, _tname, _rdata) in dbg_rela]
-        grp_name_offs = [_shname(g[0]) for g in _groups]
+        w.sec_name_offs = [_shname(s.name) for s in w.csecs]
+        w.rela_name_offs = [_shname(w.rela_prefix + w.csecs[sidx - 1].name) for sidx in w.rela_sec_order]
+        w.symtab_name_off = _shname('.symtab')
+        w.strtab_name_off = _shname('.strtab')
+        w.shstrtab_name_off = _shname('.shstrtab')
+        w.dbg_prog_name_offs = [_shname(dname) for (dname, _ddata) in w.dbg_prog]
+        w.dbg_rela_name_offs = [_shname(rname) for (rname, _tname, _rdata) in w.dbg_rela]
+        w.grp_name_offs = [_shname(g[0]) for g in w.groups]
         # 節番号が SHN_LORESERVE (0xff00) 以上になるなら、st_shndx は SHN_XINDEX にして本当の
         # 番号を `.symtab_shndx` に置く（どのセクションにもセクションシンボルがあるので数で決まる）。
-        _need_xidx = (ncs + G) >= 0xff00
+        w.need_xidx = (w.ncs + w.G) >= 0xff00
         # `.cfi_*` があれば `.eh_frame` とそのリロケーションセクションを足す。
-        if self.state.elf.cfi_cur is not None:
-            self.state.diag(" error - .cfi_startproc without .cfi_endproc.", set_error=True)
-        _has_eh = bool(self.state.elf.cfi_fdes)
-        eh_name_off = ehr_name_off = 0
-        if _has_eh:
-            eh_name_off = _shname('.eh_frame')
-            ehr_name_off = _shname(_rela_prefix + '.eh_frame')
-        xidx_name_off = _shname('.symtab_shndx') if _need_xidx else 0
-        shstrtab = bytes(shstrtab)
+        if st.elf.cfi_cur is not None:
+            st.diag(" error - .cfi_startproc without .cfi_endproc.", set_error=True)
+        w.has_eh = bool(st.elf.cfi_fdes)
+        w.eh_name_off = w.ehr_name_off = 0
+        if w.has_eh:
+            w.eh_name_off = _shname('.eh_frame')
+            w.ehr_name_off = _shname(w.rela_prefix + '.eh_frame')
+        w.xidx_name_off = _shname('.symtab_shndx') if w.need_xidx else 0
+        w.shstrtab = bytes(shstrtab)
+
+    def _elf_pack_sym(self, w, st_name, st_info, st_other, st_shndx, st_value, st_size):
+        """Elf32_Sym / Elf64_Sym を 1 つ組む。"""
+        st_value &= w.word_mask
+        st_size &= w.word_mask
+        if w.is_elf64:
+            return struct.pack(f'{w.pk}IBBHQQ', st_name, st_info, st_other, st_shndx, st_value, st_size)
+        return struct.pack(f'{w.pk}IIIBBH', st_name, st_value, st_size, st_info, st_other, st_shndx)
+
+    def _elf_symbols(self, w):
+        """シンボル表（.symtab / .strtab）を組む。局所 → `.Lcfi` → `.Lanchor` → 外部 → 大域の順。
+
+        名前 → 番号（sym_name_to_idx、`.Lcfi` は cfi_synth_idx）はリロケーションが使う。
+        """
+        st = self.state
+        bpw = w.bpw
+        csecs = w.csecs
+        G = w.G
+        word_mask = w.word_mask
+        strtab = bytearray(b'\x00')
+        syms = []
+        sym_xidx = []
+        sym_name_to_idx = {}
 
         def _find_shndx(byte_addr, sec_name=None):
             word_pc = byte_addr // bpw if bpw else 0
             if sec_name is not None:
-                _idx = sec_name_to_idx.get(sec_name)
+                _idx = w.sec_name_to_idx.get(sec_name)
                 if _idx is not None:
                     _woff = self._addr_to_word_offset(sec_name, word_pc)
                     if _woff is not None:
@@ -12720,10 +12734,6 @@ class Assembler:
                 return best_i + 1 + G, sym_val
             return 0xfff1, byte_addr
 
-        strtab = bytearray(b'\x00')
-        syms   = []
-        sym_xidx = []
-
         def _psym(nm, info, oth, shndx, special, val, sz):
             # special は SHN_ABS / SHN_COMMON などの特別な番号。それ以外で
             # 0xff00 以上の節番号は SHN_XINDEX にし、本当の番号を控える。
@@ -12732,497 +12742,402 @@ class Assembler:
                 shndx = 0xffff
             else:
                 sym_xidx.append(0)
-            syms.append(_pack_sym(nm, info, oth, shndx, val, sz))
+            syms.append(self._elf_pack_sym(w, nm, info, oth, shndx, val, sz))
 
-        # `.elfunit::word` ならシンボルの値と大きさはワード単位で書く。
-        _word_unit = (_mach_tbl_w['unit'] == 'word')
-        _bpw_sym = 1 if _word_unit else bpw
+        def _name(nm):
+            off = len(strtab)
+            strtab.extend(nm.encode() + b'\x00')
+            return off
+
+        def _label_sym(name, val, sec, is_equ, equ_has_reloc, bind):
+            # ラベル（局所か大域）のシンボル。再配置を持たない .equ は SHN_ABS。
+            _special = True
+            if is_equ and not equ_has_reloc:
+                shndx, sym_val = 0xfff1, val
+            else:
+                shndx, sym_val = _find_shndx(val * bpw, sec)
+                _special = not csecs
+                if w.word_unit:
+                    sym_val = int(sym_val) // bpw
+            sym_val = int(sym_val) & word_mask
+            _sa = _sym_attr(st, name)
+            shndx, sym_val, _sz = _sym_common_override(
+                st, name, w.bpw_sym, shndx, sym_val, _sym_size_of(st, name, w.bpw_sym))
+            sym_name_to_idx[name] = len(syms)
+            _psym(_name(name), _sym_st_info(st, name, bind), _sa[_SA_OTHER], shndx,
+                  _special or bool(_sa[_SA_COMMON]), int(sym_val) & word_mask, _sz)
 
         _psym(0, 0, 0, 0, True, 0, 0)
-
-        for i in range(ncs):
+        for i in range(w.ncs):
             _psym(0, 0x03, 0, i + 1 + G, False, 0, 0)
 
         # リンカ緩和の機種の CFI が使う局所シンボル（.Lcfi<n>）。
         _cfi_synth = {}
-        if self._cfi_relax(_mach_tbl_w):
+        if self._cfi_relax(w.mach):
             for _n, _pt in enumerate(self._cfi_points(bpw)):
                 _nm = '.Lcfi%d' % _n
-                while _nm in self.state.labels or _nm in self.state.export_labels:
+                while _nm in st.labels or _nm in st.export_labels:
                     _nm += '_'
                 _cfi_synth[_pt] = _nm
 
-        export_keys = set(self.state.export_labels.keys())
+        export_keys = set(st.export_labels.keys())
+        labels = sorted(st.labels.items())
 
-        for name, *_lentry in sorted(self.state.labels.items()):
-            val         = _lentry[0][0]
-            _lsec       = _lentry[0][1]
-            is_equ      = len(_lentry[0]) > 2 and _lentry[0][2]
-            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
-            if name in export_keys or is_imported:
+        for name, le in labels:
+            if name in export_keys or le[3]:
                 continue
-            _equ_has_reloc = is_equ and len(_lentry[0]) > 4 and _lentry[0][4] is not None
-            _special = True
-            if is_equ and not _equ_has_reloc:
-                shndx, sym_val = 0xfff1, val
-            else:
-                byte_addr = val * bpw
-                shndx, sym_val = _find_shndx(byte_addr, _lsec)
-                _special = not csecs
-                if _word_unit:
-                    sym_val = int(sym_val) // bpw
-            sym_val = int(sym_val) & _word_mask
-            _sa = _sym_attr(self.state, name)
-            _sz = _sym_size_of(self.state, name, _bpw_sym)
-            shndx, sym_val, _sz = _sym_common_override(
-                self.state, name, _bpw_sym, shndx, sym_val, _sz)
-            name_off = len(strtab)
-            strtab += name.encode() + b'\x00'
-            _psym(name_off, _sym_st_info(self.state, name, 0),
-                  _sa[_SA_OTHER], shndx, _special or bool(_sa[_SA_COMMON]),
-                  int(sym_val) & _word_mask, _sz)
+            _label_sym(name, le[0], le[1], le[2], le[2] and _lbl_rtype(le) is not None, 0)
 
+        w.cfi_synth_idx = {}
         for (_csec, _cb), _nm in _cfi_synth.items():
-            if _csec not in sec_name_to_idx:
+            if _csec not in w.sec_name_to_idx:
                 continue
-            name_off = len(strtab)
-            strtab += _nm.encode() + b'\x00'
-            _psym(name_off, 0, 0, sec_name_to_idx[_csec] + G, False,
-                  (_cb // bpw if _word_unit else _cb) & _word_mask, 0)
+            w.cfi_synth_idx[(_csec, _cb)] = len(syms)
+            _psym(_name(_nm), 0, 0, w.sec_name_to_idx[_csec] + G, False,
+                  (_cb // bpw if w.word_unit else _cb) & word_mask, 0)
 
         # アンカー（.Lanchor<n>）。対のリロケーションと `ラベル − $$` の引く項が指す。
-        for _anm, _asec, _aoff in self.state.elf.anchors:
-            if _asec not in sec_name_to_idx:
+        for _anm, _asec, _aoff in st.elf.anchors:
+            if _asec not in w.sec_name_to_idx:
                 continue
-            name_off = len(strtab)
-            strtab += _anm.encode() + b'\x00'
-            _psym(name_off, 0, 0, sec_name_to_idx[_asec] + G, False,
-                  (_aoff // bpw if _word_unit else _aoff) & _word_mask, 0)
+            sym_name_to_idx[_anm] = len(syms)
+            _psym(_name(_anm), 0, 0, w.sec_name_to_idx[_asec] + G, False,
+                  (_aoff // bpw if w.word_unit else _aoff) & word_mask, 0)
 
-        first_global = len(syms)
+        w.first_global = len(syms)
 
-        for name, *_lentry in sorted(self.state.labels.items()):
-            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
-            if not is_imported or name in export_keys:
+        for name, le in labels:
+            if not le[3] or name in export_keys:
                 continue
-            _sa = _sym_attr(self.state, name)
+            _sa = _sym_attr(st, name)
             _shndx, _sval, _sz = _sym_common_override(
-                self.state, name, _bpw_sym, 0, 0, _sym_size_of(self.state, name, _bpw_sym))
-            name_off = len(strtab)
-            strtab += name.encode() + b'\x00'
-            _psym(name_off, _sym_st_info(self.state, name, 1),
-                  _sa[_SA_OTHER], _shndx, True,
-                  int(_sval) & _word_mask, _sz)
+                st, name, w.bpw_sym, 0, 0, _sym_size_of(st, name, w.bpw_sym))
+            sym_name_to_idx[name] = len(syms)
+            _psym(_name(name), _sym_st_info(st, name, 1), _sa[_SA_OTHER], _shndx, True,
+                  int(_sval) & word_mask, _sz)
 
-        for name, *_eentry in sorted(self.state.export_labels.items()):
-            val, _sec = _eentry[0][0], _eentry[0][1]
-            if _is_undef_derived(val):
+        for name, ee in sorted(st.export_labels.items()):
+            if _is_undef_derived(ee[0]):
                 continue
-            is_equ = len(_eentry[0]) > 2 and _eentry[0][2]
-            _lbl = self.state.labels.get(name, [])
-            _equ_has_reloc = is_equ and len(_lbl) > 4 and _lbl[4] is not None
-            _special = True
-            if is_equ and not _equ_has_reloc:
-                shndx, sym_val = 0xfff1, val
-            else:
-                byte_addr = val * bpw
-                shndx, sym_val = _find_shndx(byte_addr, _sec)
-                _special = not csecs
-                if _word_unit:
-                    sym_val = int(sym_val) // bpw
-            sym_val = int(sym_val) & _word_mask
-            _sa = _sym_attr(self.state, name)
-            shndx, sym_val, _sz = _sym_common_override(
-                self.state, name, _bpw_sym, shndx, sym_val,
-                _sym_size_of(self.state, name, _bpw_sym))
-            name_off = len(strtab)
-            strtab += name.encode() + b'\x00'
-            _psym(name_off, _sym_st_info(self.state, name, 1),
-                  _sa[_SA_OTHER], shndx, _special or bool(_sa[_SA_COMMON]),
-                  int(sym_val) & _word_mask, _sz)
+            _label_sym(name, ee[0], ee[1], ee[2],
+                       ee[2] and _lbl_rtype(st.labels.get(name, [])) is not None, 1)
 
-        symtab = b''.join(syms)
-        strtab = bytes(strtab)
+        w.syms = syms
+        w.symtab = b''.join(syms)
+        w.strtab = bytes(strtab)
+        w.sym_xidx = sym_xidx
+        w.sym_name_to_idx = sym_name_to_idx
 
-        sym_name_to_idx = {}
-        _si = 1 + ncs
+    def _elf_pack_rela(self, w, r_offset, r_sym, r_type, r_addend):
+        """Elf_Rela を 1 つ組む（加数は欄の幅に収める）。"""
+        r_info = self._elf_r_info(r_sym, r_type, w.is_elf64)
+        bits = 63 if w.is_elf64 else 31
+        r_addend = min((1 << bits) - 1, max(-(1 << bits), r_addend))
+        return struct.pack(f'{w.pk}QQq' if w.is_elf64 else f'{w.pk}IIi', r_offset, r_info, r_addend)
 
-        for name, *_lentry in sorted(self.state.labels.items()):
-            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
-            if name in export_keys or is_imported:
-                continue
-            sym_name_to_idx[name] = _si
-            _si += 1
+    def _elf_pack_rel(self, w, r_offset, r_sym, r_type):
+        """Elf_Rel を 1 つ組む。"""
+        r_info = self._elf_r_info(r_sym, r_type, w.is_elf64)
+        return struct.pack(f'{w.pk}QQ' if w.is_elf64 else f'{w.pk}II', r_offset, r_info)
 
-        _cfi_synth_idx = {}
-        for _pt, _nm in _cfi_synth.items():
-            if _pt[0] not in sec_name_to_idx:
-                continue
-            _cfi_synth_idx[_pt] = _si
-            _si += 1
-
-        for _anm, _asec, _aoff in self.state.elf.anchors:
-            if _asec not in sec_name_to_idx:
-                continue
-            sym_name_to_idx[_anm] = _si
-            _si += 1
-
-        for name, *_lentry in sorted(self.state.labels.items()):
-            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
-            if not is_imported or name in export_keys:
-                continue
-            sym_name_to_idx[name] = _si
-            _si += 1
-
-        for name, *_eentry in sorted(self.state.export_labels.items()):
-            val = _eentry[0][0]
-            if _is_undef_derived(val):
-                continue
-            sym_name_to_idx[name] = _si
-            _si += 1
-
-        _RELA_ENTSIZE = 24 if _is_elf64 else 12
-        _REL_ENTSIZE  = 16 if _is_elf64 else 8
-        _REL_ENTSIZE_ACTIVE = _RELA_ENTSIZE if _is_rela else _REL_ENTSIZE
-
-        def _pack_rela(r_offset, r_sym, r_type, r_addend):
-            r_info = self._elf_r_info(r_sym, r_type, _is_elf64)
-            if _is_elf64:
-                _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
-                if r_addend > _MAX:
-                    r_addend = _MAX
-                elif r_addend < _MIN:
-                    r_addend = _MIN
-                return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
-            _MAX, _MIN = (1 << 31) - 1, -(1 << 31)
-            if r_addend > _MAX:
-                r_addend = _MAX
-            elif r_addend < _MIN:
-                r_addend = _MIN
-            return _struct.pack(f'{_pk}IIi', r_offset, r_info, r_addend)
-
-        def _pack_rel(r_offset, r_sym, r_type):
-            r_info = self._elf_r_info(r_sym, r_type, _is_elf64)
-            if _is_elf64:
-                return _struct.pack(f'{_pk}QQ', r_offset, r_info)
-            return _struct.pack(f'{_pk}II', r_offset, r_info)
-
+    def _elf_reloc_data(self, w):
+        """リロケーションセクションの中身と `.eh_frame`（ソースの `.cfi_*` から）。"""
+        st = self.state
         # `.elfrinfo` が r_info の形を決めているときは、型欄の幅の警告は出さない。
-        if not _is_elf64 and not _mach_tbl_w['rinfo']:
+        if not w.is_elf64 and not w.mach['rinfo']:
             _warned_rt = set()
             _warned_sym = False
-            for sidx in rela_sec_order:
-                for (_off, _sn, _rt, _ad, _nb, _fm) in rela_entries[sidx]:
+            for sidx in w.rela_sec_order:
+                for (_off, _sn, _rt, _ad, _nb, _fm) in w.rela_entries[sidx]:
                     if _rt > 0xFF and _rt not in _warned_rt:
                         _warned_rt.add(_rt)
-                        self.state.diag(
+                        st.diag(
                             f" warning - relocation type {_rt} does not fit the "
                             f"8-bit type field of an ELF32 r_info; it is written "
                             f"as {_rt & 0xFF}.", set_error=False)
-                    if not _warned_sym and sym_name_to_idx.get(_sn, 0) > 0xFFFFFF:
+                    if not _warned_sym and w.sym_name_to_idx.get(_sn, 0) > 0xFFFFFF:
                         _warned_sym = True
-                        self.state.diag(
+                        st.diag(
                             " warning - more than 16777215 symbols: the symbol "
                             "index does not fit the 24-bit field of an ELF32 "
                             "r_info.", set_error=False)
 
-        rela_datas = []
-        for sidx in rela_sec_order:
-            entries = rela_entries[sidx]
-            if _is_rela:
-                data = b''.join(
-                    _pack_rela(off, sym_name_to_idx.get(sn, 0), rtype, addend)
-                    for (off, sn, rtype, addend, _nbytes, _fm) in entries
-                )
+        def pack_all(entries):
+            if w.is_rela:
+                return b''.join(self._elf_pack_rela(w, off, w.sym_name_to_idx.get(sn, 0), rt, ad)
+                                for (off, sn, rt, ad, _nb, _fm) in entries)
+            return b''.join(self._elf_pack_rel(w, off, w.sym_name_to_idx.get(sn, 0), rt)
+                            for (off, sn, rt, _ad, _nb, _fm) in entries)
+        w.rela_datas = [pack_all(w.rela_entries[sidx]) for sidx in w.rela_sec_order]
+
+        w.eh_data, w.eh_rdata = b'', b''
+        if w.has_eh:
+            w.eh_data, _eh_r = self._build_eh_frame(
+                w.mach, w.is_elf64, w.is_rela, w.pk, w.bpw,
+                {s.name: i + 1 for i, s in enumerate(w.csecs)}, w.cfi_synth_idx,
+                w.sym_name_to_idx)
+            if w.is_rela:
+                w.eh_rdata = b''.join(self._elf_pack_rela(w, o, si, rt, a) for (o, si, rt, a) in _eh_r)
             else:
-                data = b''.join(
-                    _pack_rel(off, sym_name_to_idx.get(sn, 0), rtype)
-                    for (off, sn, rtype, _addend, _nbytes, _fm) in entries
-                )
-            rela_datas.append(data)
+                w.eh_rdata = b''.join(self._elf_pack_rel(w, o, si, rt) for (o, si, rt, _a) in _eh_r)
 
-        # `.eh_frame`（ソースの `.cfi_*` から）。
-        eh_data, eh_rdata = b'', b''
-        if _has_eh:
-            _eh_d, _eh_r = self._build_eh_frame(
-                _mach_tbl_w, _is_elf64, _is_rela, _pk, bpw,
-                {s.name: i + 1 for i, s in enumerate(csecs)}, _cfi_synth_idx,
-                sym_name_to_idx)
-            eh_data = _eh_d
-            if _is_rela:
-                eh_rdata = b''.join(_pack_rela(o, si, rt, a) for (o, si, rt, a) in _eh_r)
-            else:
-                eh_rdata = b''.join(_pack_rel(o, si, rt) for (o, si, rt, _a) in _eh_r)
+    @staticmethod
+    def _align_up(x, a):
+        return (x + a - 1) & ~(a - 1)
 
-        def _is_nobits(s):
-            return s.sh_type == 8
+    def _elf_layout(self, w):
+        """ファイルの中の位置（各セクション・表・ヘッダ表）とセクション番号を決める。"""
+        st = self.state
+        G = w.G
+        ncs, nrela = w.ncs, w.nrela
+        _align_up = self._align_up
 
-        offset = _ehdr_size
-        sec_offsets = []
-        for s in csecs:
+        offset = w.ehdr_size
+        w.sec_offsets = []
+        for s in w.csecs:
             # ファイル内の位置も sh_addralign に合わせる（16 を下限）。
             # `.elfsection` で 64 などの大きな整列を書いたセクションも、
             # GNU as と同じくファイル上でその境界から始まる。
-            _al_f = s.align if s.align is not None \
-                else _elf_default_align(s.sh_type, _is_elf64)
+            _al_f = s.align if s.align is not None else _elf_default_align(s.sh_type)
             offset = _align_up(offset, max(16, _al_f or 1))
-            sec_offsets.append(offset)
-            if not _is_nobits(s):
+            w.sec_offsets.append(offset)
+            if s.sh_type != 8:
                 offset += s.byte_size
 
-        rela_offsets = []
-        for rd in rela_datas:
+        w.rela_offsets = []
+        for rd in w.rela_datas:
             offset = _align_up(offset, 8)
-            rela_offsets.append(offset)
+            w.rela_offsets.append(offset)
             offset += len(rd)
 
-        symtab_off  = _align_up(offset, 8)
-        offset = symtab_off + len(symtab)
-        strtab_off  = offset
-        offset += len(strtab)
-        shstrtab_off = offset
-        offset += len(shstrtab)
+        w.symtab_off = _align_up(offset, 8)
+        offset = w.symtab_off + len(w.symtab)
+        w.strtab_off = offset
+        offset += len(w.strtab)
+        w.shstrtab_off = offset
+        offset += len(w.shstrtab)
 
         base_idx = ncs + nrela + 3 + G
-        dbg_prog_offsets = []
-        dbg_prog_shndx = {}
-        for i, (dname, ddata) in enumerate(dbg_prog):
+        w.dbg_prog_offsets = []
+        w.dbg_prog_shndx = {}
+        for i, (dname, ddata) in enumerate(w.dbg_prog):
             offset = _align_up(offset, 1)
-            dbg_prog_offsets.append(offset)
-            dbg_prog_shndx[dname] = base_idx + 1 + i
+            w.dbg_prog_offsets.append(offset)
+            w.dbg_prog_shndx[dname] = base_idx + 1 + i
             offset += len(ddata)
-        dbg_rela_offsets = []
-        for i, (rname, tname, rdata) in enumerate(dbg_rela):
+        w.dbg_rela_offsets = []
+        for i, (rname, tname, rdata) in enumerate(w.dbg_rela):
             offset = _align_up(offset, 8)
-            dbg_rela_offsets.append(offset)
+            w.dbg_rela_offsets.append(offset)
             offset += len(rdata)
 
-        ndbg = len(dbg_prog) + len(dbg_rela)
-        total_shdrs = 1 + ncs + nrela + 3 + ndbg + G
-        shstrndx    = ncs + nrela + 3 + G
-        symtab_shidx = ncs + nrela + 1 + G
-        strtab_shidx = ncs + nrela + 2 + G
-        symtab_link = strtab_shidx
+        ndbg = len(w.dbg_prog) + len(w.dbg_rela)
+        w.total_shdrs = 1 + ncs + nrela + 3 + ndbg + G
+        w.shstrndx = ncs + nrela + 3 + G
+        w.symtab_shidx = ncs + nrela + 1 + G
+        w.strtab_shidx = ncs + nrela + 2 + G
 
         # グループの中身: フラグの語、続いてメンバーのセクション番号（メンバーの
         # リロケーションセクションも同じグループに入れる）。sh_info は署名の
         # シンボル番号。署名がセクション名ならそのセクションシンボル。
-        _rela_hidx = {sidx: ncs + 1 + ri + G for ri, sidx in enumerate(rela_sec_order)}
-        grp_datas = []
-        grp_info = []
-        for (_gn, _gsig, _gfl, _nums) in _groups:
-            _words = [_gfl]
-            for _k in _nums:
-                _words.append(_k + G)
-            for _k in _nums:
-                if _k in _rela_hidx:
-                    _words.append(_rela_hidx[_k])
-            grp_datas.append(b''.join(_struct.pack(f'{_pk}I', w & 0xFFFFFFFF) for w in _words))
-            _si = sym_name_to_idx.get(_gsig)
+        w.rela_hidx = {sidx: ncs + 1 + ri + G for ri, sidx in enumerate(w.rela_sec_order)}
+        w.grp_datas = []
+        w.grp_info = []
+        for (_gn, _gsig, _gfl, _nums) in w.groups:
+            _words = [_gfl] + [_k + G for _k in _nums] + [w.rela_hidx[_k] for _k in _nums if _k in w.rela_hidx]
+            w.grp_datas.append(b''.join(struct.pack(f'{w.pk}I', x & 0xFFFFFFFF) for x in _words))
+            _si = w.sym_name_to_idx.get(_gsig)
             if _si is None:
-                _si = next((i + 1 for i, cs in enumerate(csecs) if cs.name == _gsig), None)
+                _si = next((i + 1 for i, cs in enumerate(w.csecs) if cs.name == _gsig), None)
             if _si is None:
-                self.state.diag(f" warning - .elfgroup: signature symbol '{_gsig}' of group "
-                                f"'{_gn}' is not in the symbol table.", set_error=False)
+                st.diag(f" warning - .elfgroup: signature symbol '{_gsig}' of group "
+                        f"'{_gn}' is not in the symbol table.", set_error=False)
                 _si = 0
-            grp_info.append(_si)
-        grp_offsets = []
-        for gd in grp_datas:
+            w.grp_info.append(_si)
+        w.grp_offsets = []
+        for gd in w.grp_datas:
             offset = _align_up(offset, 4)
-            grp_offsets.append(offset)
+            w.grp_offsets.append(offset)
             offset += len(gd)
 
-        eh_off = ehr_off = eh_shidx = 0
-        eh_fl, eh_ty, eh_al, eh_es = _elf_section_attrs(self.state, '.eh_frame')
-        if eh_al is None:
-            eh_al = (self.state.elf.decl_cfi[3] if self.state.elf.decl_cfi
-                     and self.state.elf.decl_cfi[3] else (8 if _is_elf64 else 4))
-        if _has_eh:
-            offset = _align_up(offset, max(1, eh_al))
-            eh_off = offset
-            offset += len(eh_data)
+        w.eh_off = w.ehr_off = w.eh_shidx = 0
+        w.eh_fl, w.eh_ty, w.eh_al, w.eh_es = _elf_section_attrs(st, '.eh_frame')
+        if w.eh_al is None:
+            w.eh_al = (st.elf.decl_cfi[3] if st.elf.decl_cfi and st.elf.decl_cfi[3]
+                       else (8 if w.is_elf64 else 4))
+        if w.has_eh:
+            offset = _align_up(offset, max(1, w.eh_al))
+            w.eh_off = offset
+            offset += len(w.eh_data)
             offset = _align_up(offset, 8)
-            ehr_off = offset
-            offset += len(eh_rdata)
-            eh_shidx = total_shdrs
-            total_shdrs += 2
+            w.ehr_off = offset
+            offset += len(w.eh_rdata)
+            w.eh_shidx = w.total_shdrs
+            w.total_shdrs += 2
 
-        xidx_data = b''
-        xidx_off = 0
-        xidx_shidx = 0
-        if _need_xidx:
-            xidx_data = b''.join(_struct.pack(f'{_pk}I', x & 0xFFFFFFFF) for x in sym_xidx)
+        w.xidx_data = b''
+        w.xidx_off = 0
+        w.xidx_shidx = 0
+        if w.need_xidx:
+            w.xidx_data = b''.join(struct.pack(f'{w.pk}I', x & 0xFFFFFFFF) for x in w.sym_xidx)
             offset = _align_up(offset, 4)
-            xidx_off = offset
-            offset += len(xidx_data)
-            xidx_shidx = total_shdrs
-            total_shdrs += 1
+            w.xidx_off = offset
+            offset += len(w.xidx_data)
+            w.xidx_shidx = w.total_shdrs
+            w.total_shdrs += 1
 
-        shdr_off    = _align_up(offset, 8)
+        w.shdr_off = _align_up(offset, 8)
 
-        # `.elflink` の sh_link / sh_info。値はセクション名か数（10 進か 0x 付き 16 進）。
-        def _shidx_of(text, sname, what):
-            if not text:
-                return 0
-            t = text.strip()
-            if (t.isascii() and t.isdigit()):
-                return int(t, 10)
-            if t[:2].translate(_ALOWER) == '0x' and len(t) > 2 and all(c in '0123456789abcdefABCDEF' for c in t[2:]):
-                return int(t, 16)
-            tl = t.translate(_ALOWER)
-            for i, cs in enumerate(csecs):
-                if cs.name.translate(_ALOWER) == tl:
-                    return i + 1 + G
-            for ri, sidx in enumerate(rela_sec_order):
-                if (_rela_prefix + csecs[sidx - 1].name).translate(_ALOWER) == tl:
-                    return ncs + 1 + ri + G
-            if tl == '.symtab':
-                return symtab_shidx
-            if tl == '.strtab':
-                return strtab_shidx
-            if tl == '.shstrtab':
-                return shstrndx
-            for dname in dbg_prog_shndx:
-                if dname.translate(_ALOWER) == tl:
-                    return dbg_prog_shndx[dname]
-            self.state.diag(f" warning - .elflink: {what} of '{sname}': no section "
-                            f"named '{t}'; written as 0.", set_error=False)
+    def _elf_shidx_of(self, w, text, sname, what):
+        """`.elflink` の sh_link / sh_info。値はセクション名か数（10 進か 0x 付き 16 進）。"""
+        if not text:
             return 0
+        t = text.strip()
+        if (t.isascii() and t.isdigit()):
+            return int(t, 10)
+        if t[:2].translate(_ALOWER) == '0x' and len(t) > 2 and all(c in '0123456789abcdefABCDEF' for c in t[2:]):
+            return int(t, 16)
+        tl = t.translate(_ALOWER)
+        for i, cs in enumerate(w.csecs):
+            if cs.name.translate(_ALOWER) == tl:
+                return i + 1 + w.G
+        for ri, sidx in enumerate(w.rela_sec_order):
+            if (w.rela_prefix + w.csecs[sidx - 1].name).translate(_ALOWER) == tl:
+                return w.ncs + 1 + ri + w.G
+        if tl == '.symtab':
+            return w.symtab_shidx
+        if tl == '.strtab':
+            return w.strtab_shidx
+        if tl == '.shstrtab':
+            return w.shstrndx
+        for dname in w.dbg_prog_shndx:
+            if dname.translate(_ALOWER) == tl:
+                return w.dbg_prog_shndx[dname]
+        self.state.diag(f" warning - .elflink: {what} of '{sname}': no section "
+                        f"named '{t}'; written as 0.", set_error=False)
+        return 0
+
+    def _elf_write(self, w, path, machine):
+        """決めた位置どおりにファイルへ書く（開けなければ診断して偽）。"""
+        st = self.state
+        pk = w.pk
+        is_elf64 = w.is_elf64
+        G = w.G
+
+        def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
+            hdr = w.hdr
+            ident = (b'\x7fELF'
+                     + bytes([2 if is_elf64 else 1, 1 if w.is_le else 2, 1,
+                              hdr.get('osabi', st.elf.osabi) & 0xFF, hdr.get('abiversion', 0) & 0xFF])
+                     + b'\x00' * 7)
+            # e_phoff は 0、プログラムヘッダは無い。e_shentsize は 64 / 40。
+            return ident + struct.pack(pk + ('HHIQQQIHHHHHH' if is_elf64 else 'HHIIIIIHHHHHH'),
+                                       hdr.get('type', e_type) & 0xFFFF, e_machine,
+                                       hdr.get('version', 1) & 0xFFFFFFFF,
+                                       hdr.get('entry', 0) & w.word_mask, 0, e_shoff,
+                                       hdr.get('flags', 0) & 0xFFFFFFFF, w.ehdr_size, 0, 0,
+                                       64 if is_elf64 else 40, e_shnum, e_shstrndx)
+
+        def _pack_shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                       sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
+            return struct.pack(pk + ('IIQQQQIIQQ' if is_elf64 else 'IIIIIIIIII'),
+                               sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                               sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
 
         try:
             _elf_file = open(path, 'wb')
         except OSError as _e:
-            self.state.diag(f" error - cannot create ELF output file '{path}': {_e}", set_error=True)
-            return
+            st.diag(f" error - cannot create ELF output file '{path}': {_e}", set_error=True)
+            return False
         with _elf_file as f:
+            def put(at, data):
+                # at の位置まで 0 で詰めて data を書く。
+                f.write(b'\x00' * (at - f.tell()))
+                f.write(data)
+
             # SHN_LORESERVE 以上の数は 0 番目のセクションヘッダに置く（ELF の決まり）。
-            f.write(_pack_ehdr(1, machine, shdr_off,
-                               0 if total_shdrs >= 0xff00 else total_shdrs,
-                               0xffff if shstrndx >= 0xff00 else shstrndx))
+            f.write(_pack_ehdr(1, machine, w.shdr_off,
+                               0 if w.total_shdrs >= 0xff00 else w.total_shdrs,
+                               0xffff if w.shstrndx >= 0xff00 else w.shstrndx))
+            for i, s in enumerate(w.csecs):
+                put(w.sec_offsets[i], b'' if s.sh_type == 8 else s.data)
+            for i, rd in enumerate(w.rela_datas):
+                put(w.rela_offsets[i], rd)
+            put(w.symtab_off, w.symtab)
+            f.write(w.strtab)
+            f.write(w.shstrtab)
+            for i, (dname, ddata) in enumerate(w.dbg_prog):
+                put(w.dbg_prog_offsets[i], ddata)
+            for i, (rname, tname, rdata) in enumerate(w.dbg_rela):
+                put(w.dbg_rela_offsets[i], rdata)
+            for i, gd in enumerate(w.grp_datas):
+                put(w.grp_offsets[i], gd)
+            if w.has_eh:
+                put(w.eh_off, w.eh_data)
+                put(w.ehr_off, w.eh_rdata)
+            if w.need_xidx:
+                put(w.xidx_off, w.xidx_data)
+            put(w.shdr_off, _pack_shdr(0, 0, 0, 0, 0,
+                                       w.total_shdrs if w.total_shdrs >= 0xff00 else 0,
+                                       w.shstrndx if w.shstrndx >= 0xff00 else 0, 0, 0, 0))
 
-            for i, s in enumerate(csecs):
-                cur = f.tell()
-                f.write(b'\x00' * (sec_offsets[i] - cur))
-                if not _is_nobits(s):
-                    f.write(s.data)
-
-            for i, rd in enumerate(rela_datas):
-                cur = f.tell()
-                f.write(b'\x00' * (rela_offsets[i] - cur))
-                f.write(rd)
-
-            cur = f.tell()
-            f.write(b'\x00' * (symtab_off - cur))
-            f.write(symtab)
-
-            f.write(strtab)
-
-            f.write(shstrtab)
-
-            for i, (dname, ddata) in enumerate(dbg_prog):
-                cur = f.tell()
-                f.write(b'\x00' * (dbg_prog_offsets[i] - cur))
-                f.write(ddata)
-            for i, (rname, tname, rdata) in enumerate(dbg_rela):
-                cur = f.tell()
-                f.write(b'\x00' * (dbg_rela_offsets[i] - cur))
-                f.write(rdata)
-
-            for i, gd in enumerate(grp_datas):
-                cur = f.tell()
-                f.write(b'\x00' * (grp_offsets[i] - cur))
-                f.write(gd)
-
-            if _has_eh:
-                cur = f.tell()
-                f.write(b'\x00' * (eh_off - cur))
-                f.write(eh_data)
-                cur = f.tell()
-                f.write(b'\x00' * (ehr_off - cur))
-                f.write(eh_rdata)
-
-            if _need_xidx:
-                cur = f.tell()
-                f.write(b'\x00' * (xidx_off - cur))
-                f.write(xidx_data)
-
-            cur = f.tell()
-            f.write(b'\x00' * (shdr_off - cur))
-
-            f.write(_pack_shdr(0, 0, 0, 0, 0,
-                               total_shdrs if total_shdrs >= 0xff00 else 0,
-                               shstrndx if shstrndx >= 0xff00 else 0, 0, 0, 0))
-
-            for i, gd in enumerate(grp_datas):
+            for i, gd in enumerate(w.grp_datas):
                 f.write(_pack_shdr(
-                    grp_name_offs[i], 17, 0, 0, grp_offsets[i], len(gd),
-                    symtab_shidx, grp_info[i], 4, 4))
+                    w.grp_name_offs[i], 17, 0, 0, w.grp_offsets[i], len(gd),
+                    w.symtab_shidx, w.grp_info[i], 4, 4))
 
-            for i, s in enumerate(csecs):
-                _sh_type_i = s.sh_type
-                _al_i = (s.align if s.align is not None
-                         else _elf_default_align(_sh_type_i, _is_elf64))
-                _lk_t, _inf_t = self.state.elf.decl_link.get(s.name.translate(_ALOWER), ('', ''))
+            for i, s in enumerate(w.csecs):
+                _al_i = s.align if s.align is not None else _elf_default_align(s.sh_type)
+                _lk_t, _inf_t = st.elf.decl_link.get(s.name.translate(_ALOWER), ('', ''))
                 f.write(_pack_shdr(
-                    sec_name_offs[i], _sh_type_i, s.flags, 0,
-                    sec_offsets[i], s.byte_size,
-                    _shidx_of(_lk_t, s.name, 'sh_link'),
-                    _shidx_of(_inf_t, s.name, 'sh_info'), _al_i, s.entsize))
+                    w.sec_name_offs[i], s.sh_type, s.flags, 0,
+                    w.sec_offsets[i], s.byte_size,
+                    self._elf_shidx_of(w, _lk_t, s.name, 'sh_link'),
+                    self._elf_shidx_of(w, _inf_t, s.name, 'sh_info'), _al_i, s.entsize))
 
-            _word_align = 8 if _is_elf64 else 4
-            _sym_entsize = 24 if _is_elf64 else 16
-            _rela_sh_type = 4 if _is_rela else 9
-            for ri, sidx in enumerate(rela_sec_order):
+            for ri, sidx in enumerate(w.rela_sec_order):
                 f.write(_pack_shdr(
-                    rela_name_offs[ri], _rela_sh_type,
-                    0x40 | (0x200 if sidx in _grp_members else 0), 0,
-                    rela_offsets[ri], len(rela_datas[ri]),
-                    symtab_shidx, sidx + G, _word_align, _REL_ENTSIZE_ACTIVE))
+                    w.rela_name_offs[ri], w.rela_sh_type,
+                    0x40 | (0x200 if sidx in w.grp_members else 0), 0,
+                    w.rela_offsets[ri], len(w.rela_datas[ri]),
+                    w.symtab_shidx, sidx + G, w.word_align, w.rel_entsize))
 
             f.write(_pack_shdr(
-                symtab_name_off, 2, 0, 0,
-                symtab_off, len(symtab),
-                symtab_link, first_global, _word_align, _sym_entsize))
-
+                w.symtab_name_off, 2, 0, 0,
+                w.symtab_off, len(w.symtab),
+                w.strtab_shidx, w.first_global, w.word_align, w.sym_entsize))
             f.write(_pack_shdr(
-                strtab_name_off, 3, 0, 0,
-                strtab_off, len(strtab), 0, 0, 1, 0))
-
+                w.strtab_name_off, 3, 0, 0,
+                w.strtab_off, len(w.strtab), 0, 0, 1, 0))
             f.write(_pack_shdr(
-                shstrtab_name_off, 3, 0, 0,
-                shstrtab_off, len(shstrtab), 0, 0, 1, 0))
+                w.shstrtab_name_off, 3, 0, 0,
+                w.shstrtab_off, len(w.shstrtab), 0, 0, 1, 0))
 
-            for i, (dname, ddata) in enumerate(dbg_prog):
+            for i, (dname, ddata) in enumerate(w.dbg_prog):
                 f.write(_pack_shdr(
-                    dbg_prog_name_offs[i], 1, 0, 0,
-                    dbg_prog_offsets[i], len(ddata), 0, 0, 1, 0))
-            for i, (rname, tname, rdata) in enumerate(dbg_rela):
+                    w.dbg_prog_name_offs[i], 1, 0, 0,
+                    w.dbg_prog_offsets[i], len(ddata), 0, 0, 1, 0))
+            for i, (rname, tname, rdata) in enumerate(w.dbg_rela):
                 f.write(_pack_shdr(
-                    dbg_rela_name_offs[i], _rela_sh_type, 0x40, 0,
-                    dbg_rela_offsets[i], len(rdata),
-                    symtab_shidx, dbg_prog_shndx.get(tname, 0),
-                    _word_align, _REL_ENTSIZE_ACTIVE))
-            if _has_eh:
+                    w.dbg_rela_name_offs[i], w.rela_sh_type, 0x40, 0,
+                    w.dbg_rela_offsets[i], len(rdata),
+                    w.symtab_shidx, w.dbg_prog_shndx.get(tname, 0),
+                    w.word_align, w.rel_entsize))
+            if w.has_eh:
                 f.write(_pack_shdr(
-                    eh_name_off, eh_ty, eh_fl, 0, eh_off, len(eh_data),
-                    0, 0, eh_al, eh_es))
+                    w.eh_name_off, w.eh_ty, w.eh_fl, 0, w.eh_off, len(w.eh_data),
+                    0, 0, w.eh_al, w.eh_es))
                 f.write(_pack_shdr(
-                    ehr_name_off, _rela_sh_type, 0x40, 0, ehr_off, len(eh_rdata),
-                    symtab_shidx, eh_shidx, _word_align, _REL_ENTSIZE_ACTIVE))
-            if _need_xidx:
+                    w.ehr_name_off, w.rela_sh_type, 0x40, 0, w.ehr_off, len(w.eh_rdata),
+                    w.symtab_shidx, w.eh_shidx, w.word_align, w.rel_entsize))
+            if w.need_xidx:
                 f.write(_pack_shdr(
-                    xidx_name_off, 18, 0, 0, xidx_off, len(xidx_data),
-                    symtab_shidx, 0, 4, 4))
-
-        _dbg_msg = f", {len(dbg_prog)} debug section(s)" if dbg_prog else ""
-        _reloc_kind = "rela" if _is_rela else "rel"
-        print(f"elf: wrote {path} ({ncs} section(s), {nrela} {_reloc_kind} section(s), "
-              f"{len(syms)} symbol(s){_dbg_msg})",
-              file=sys.stderr)
+                    w.xidx_name_off, 18, 0, 0, w.xidx_off, len(w.xidx_data),
+                    w.symtab_shidx, 0, 4, 4))
+        return True
 
     def _build_arg_parser(self):
         """コマンドライン引数の定義。"""
-        import argparse
         ap = argparse.ArgumentParser(
             prog='axx',
             description='axx general assembler programmed and designed by Taisuke Maekawa',
@@ -13347,90 +13262,37 @@ class Assembler:
     def _build_dir_dispatch(self, pat, isdir):
         """ディレクティブ行ごとに呼ぶハンドラを先に決めておく（毎行すべてを試さないため）。"""
         d = self.directive_proc
-        table = {
-            '.setsym': d.set_symbol, '.clearsym': d.clear_symbol, '.padding': d.paddingp,
-            '.bits': d.bits, '.symbolc': d.symbolc, '.vliw': d.vliwp,
-            '.check': d.check_processing, '.clrcheck': d.clrcheck_processing,
-            '.reloc': d.reloc_processing, '.clrreloc': d.clrreloc_processing,
-            '.map': d.map_processing, '.free': d.free_processing,
-            '.passthru': d.passthru_processing, '.eol': d.eol_processing,
-            '.textmode': d.textmode_processing, '.enum': d.enum_processing,
-            '.clrenum': d.clrenum_processing, '.error': d.errmsg_processing,
-            '.echo': d.echo_processing, '.unordered': d.unordered_processing,
-        }
-        table.update((n, getattr(d, n[1:] + '_processing')) for n in self._ELF_DECLS)
-        out = []
-        for row, i in enumerate(pat):
-            fn = None
-            if isdir[row] and i and i[0]:
-                fn = table.get(i[0])
-                if fn is None:
-                    fn = d.epic
-            out.append(fn)
-        return out
+        return [getattr(d, _PAT_DIRECTIVE_HANDLERS.get(i[0], 'epic'))
+                if isdir[row] and i and i[0] else None
+                for row, i in enumerate(pat)]
 
-    def _macro_expand_only(self, sourcefile, dest):
-        """`-P` — ソースをマクロ展開して書き出し、アセンブルせずに終わる。"""
-        self.macro_proc.reset_pass()
+    def _expand_only(self, proc, path, dest, what):
+        """`-P` / `-p` — ファイル（what は 'source' か 'pattern'）をマクロ展開して書き出し、アセンブルせずに終わる。"""
+        proc.reset_pass()
         try:
-            with open(sourcefile, "rt", encoding="utf-8", errors="surrogateescape") as f:
+            with open(path, "rt", encoding="utf-8", errors="surrogateescape") as f:
                 raw = f.readlines()
         except OSError as e:
-            self.state.diag(f" error - cannot open source file '{sourcefile}': {e}", set_error=False, force=True)
-            return False
-        except UnicodeDecodeError as e:
-            self.state.diag(f" error - source file '{sourcefile}' is not valid UTF-8: {e}", set_error=False, force=True)
-            return False
-
-        expanded = self.macro_proc.expand(raw, sourcefile)
-        if self.macro_proc.had_error or self.state.had_error:
-            return False
-
-        out = []
-        for text, fname, ln in expanded:
-            out.append(f"{text}\n")
-        data = ''.join(out)
-        if dest in ('-', ''):
-            sys.stdout.write(data)
-        else:
-            try:
-                with open(dest, "wt", encoding="utf-8", errors="surrogateescape") as f:
-                    f.write(data)
-            except OSError as e:
-                self.state.diag(f" error - cannot write '{dest}': {e}", set_error=False, force=True)
-                return False
-        return True
-
-    def _pat_macro_expand_only(self, patternfile, dest):
-        """`-p` — パターンファイルをマクロ展開して書き出して終わる。"""
-        self.pat_macro_proc.reset_pass()
-        try:
-            with open(patternfile, "rt", encoding="utf-8", errors="surrogateescape") as f:
-                raw = f.readlines()
-        except OSError as e:
-            self.state.diag(f" error - cannot open pattern file '{patternfile}': {e}",
+            self.state.diag(f" error - cannot open {what} file '{path}': {e}",
                             set_error=False, force=True)
             return False
         except UnicodeDecodeError as e:
-            self.state.diag(f" error - pattern file '{patternfile}' is not valid UTF-8: {e}",
+            self.state.diag(f" error - {what} file '{path}' is not valid UTF-8: {e}",
                             set_error=False, force=True)
             return False
-
-        expanded = self.pat_macro_proc.expand(raw, patternfile)
-        if self.pat_macro_proc.had_error or self.state.had_error:
+        expanded = proc.expand(raw, path)
+        if proc.had_error or self.state.had_error:
             return False
-
         data = ''.join(text + "\n" for text, _fname, _ln in expanded)
         if dest in ('-', ''):
             sys.stdout.write(data)
-        else:
-            try:
-                with open(dest, "wt", encoding="utf-8", errors="surrogateescape") as f:
-                    f.write(data)
-            except OSError as e:
-                self.state.diag(f" error - cannot write '{dest}': {e}",
-                                set_error=False, force=True)
-                return False
+            return True
+        try:
+            with open(dest, "wt", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(data)
+        except OSError as e:
+            self.state.diag(f" error - cannot write '{dest}': {e}", set_error=False, force=True)
+            return False
         return True
 
     @staticmethod
@@ -13476,427 +13338,425 @@ class Assembler:
             i += 1
         return out
 
-    def run(self):
-        """入口。引数を読み、パターンとソースを読み、出力を書く。
+    _OSABI = {'linux': 0, 'freebsd': 9}
 
-        パス1は最大 MAX_RELAX (16) 回のリラクゼーション。各反復の終わりの「ラベル → (番地,
-        セクション)」が前回と同じなら収束、過去の写しと同じなら振動として中断する（誤った番地の
-        コードは出さない）。パス2は確定した番地で 1 回だけ回し、パス1と食い違えばエラー。
-        """
-        ap = self._build_arg_parser()
-
-        if len(sys.argv) == 1:
-            ap.print_help()
-            return True
-
-        args = ap.parse_args(self._normalise_macro_expand_argv(sys.argv[1:]))
-
-        osabitbl = {'linux': 0, 'freebsd': 9}
-
-        self.state.outfile      = args.outfile
-        self.state.expfile      = args.expfile
-        self.state.expfile_elf  = args.expfile_elf
-        self.state.impfile      = args.impfile
-        self.state.elf.objfile  = args.elf_objfile
+    def _apply_args(self, args):
+        """コマンドライン引数を状態に写す（-m の範囲外は偽）。"""
+        st = self.state
+        st.outfile = args.outfile
+        st.expfile = args.expfile
+        st.expfile_elf = args.expfile_elf
+        st.impfile = args.impfile
+        st.elf.objfile = args.elf_objfile
 
         if args.elf_machine is not None:
             if not 0 <= args.elf_machine <= 65535:
-                self.state.diag(f" error - -m/--machine value {args.elf_machine} is out of "
-                     f"range (an ELF e_machine number is 0..65535).",
-                     set_error=False, force=True)
+                st.diag(f" error - -m/--machine value {args.elf_machine} is out of "
+                        f"range (an ELF e_machine number is 0..65535).",
+                        set_error=False, force=True)
                 return False
-            self.state.elf.machine = args.elf_machine
-            self.state.elf.machine_from_cli = True
+            st.elf.machine = args.elf_machine
+            st.elf.machine_from_cli = True
             if args.elf_machine not in ELF_MACHINES and args.elf_objfile:
                 _known = ', '.join(f"{m} ({ELF_MACHINES[m]['name']})" for m in sorted(ELF_MACHINES))
-                self.state.diag(f" warning - -m/--machine value {args.elf_machine} is not one of "
-                     f"the machines axx has built-in relocation numbering for ({_known}); "
-                     f"relocation types must come from the pattern file (.elftype / "
-                     f".elfwidth / .elfextern). References whose type is not declared get "
-                     f"no relocation entry, rather than a guessed (and wrong) one.",
-                     set_error=False, force=True)
+                st.diag(f" warning - -m/--machine value {args.elf_machine} is not one of "
+                        f"the machines axx has built-in relocation numbering for ({_known}); "
+                        f"relocation types must come from the pattern file (.elftype / "
+                        f".elfwidth / .elfextern). References whose type is not declared get "
+                        f"no relocation entry, rather than a guessed (and wrong) one.",
+                        set_error=False, force=True)
 
-        self.state.elf.elf_class    = None if args.elf_format is None else \
-                                  (2 if args.elf_format == 64 else 1)
+        st.elf.elf_class = None if args.elf_format is None else (2 if args.elf_format == 64 else 1)
 
         _osabi_key = args.elf_osabi.translate(_ALOWER)
-        if _osabi_key not in osabitbl:
+        if _osabi_key not in self._OSABI:
             print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
-                  f"valid choices are {list(osabitbl.keys())} (case-insensitive). Using 'Linux'.",
+                  f"valid choices are {list(self._OSABI.keys())} (case-insensitive). Using 'Linux'.",
                   file=sys.stderr)
-        self.state.elf.osabi        = osabitbl.get(_osabi_key, 0)
-        self.state.verbose      = args.verbose
-        self.state.text_output  = args.text_output
-        self.state.debug        = args.debug
-        self.state.elf.gen_debug    = args.gen_debug
+        st.elf.osabi = self._OSABI.get(_osabi_key, 0)
+        st.verbose = args.verbose
+        st.text_output = args.text_output
+        st.debug = args.debug
+        st.elf.gen_debug = args.gen_debug
         self.macro_proc.enabled = not args.no_macro
         self.pat_macro_proc.enabled = not args.no_macro
+        return True
+
+    def _abort(self, where):
+        """読み込み・アセンブル中のエラーを締めくくる 2 行を出す（返り値は常に偽）。"""
+        self.state.diag(f" error - one or more errors were reported {where}; "
+                        "output would be incomplete or wrong.", set_error=False, force=True)
+        self.state.diag("         Aborting: no output file written.", set_error=False, force=True)
+        return False
+
+    def _load_pattern(self, patternfile):
+        """パターンファイルを読み、索引・持ち上げ・`.unordered` の順・シンボル・ELF 宣言を整える。"""
+        st = self.state
+        st.pat = self.pattern_reader.readpat(patternfile)
+        st.pat_isdir = [_pat_is_directive(_p) for _p in st.pat]
+        st.pat_index, st.pat_always, st.pat_maxkey = _build_pat_index(st.pat, st.pat_isdir)
+        st.hoist_rows, st.hoist_fields = _pat_hoist_scan(st.pat, st.pat_isdir)
+        st.hoist_first_ai = sum(1 for _r in st.pat_always if _r < st.hoist_rows)
+        _dirorder = _pat_unordered_plan(st.pat, st.pat_isdir)
+        st.unordered = _dirorder is not None
+        st.pat_dirorder = _dirorder or []
+        if st.unordered:
+            st.pat_always = [_r for _r in st.pat_always if not st.pat_isdir[_r]]
+            st.hoist_rows = 0
+            st.hoist_first_ai = 0
+        st.pat_dirfn = self._build_dir_dispatch(st.pat, st.pat_isdir)
+        st.sub_defs = self.pattern_reader.subs
+        st.func_defs = self.pattern_reader.funcs
+        if st.had_error:
+            return self._abort('during assembly')
+        if st.unordered:
+            self.setpatsymbols([st.pat[_r] for _r in st.pat_dirorder])
+        else:
+            self.setpatsymbols(st.pat)
+        self.register_elfdecls(st.pat)
+        if st.had_error:
+            return self._abort('while reading the pattern file')
+        return True
+
+    def _import_labels(self, path):
+        """`-i` — ラベルの取り込み。セクションの行（3 欄以上）を先に、ラベルの行（2 欄）を後に読む。"""
+        try:
+            with open(path, 'rt', encoding="utf-8", errors="surrogateescape") as label_file:
+                raw_lines = label_file.readlines()
+        except OSError as e:
+            self.state.diag(f" error - cannot open import file '{path}': {e}", set_error=True)
+            return False
+        except UnicodeDecodeError as e:
+            self.state.diag(f" error - import file '{path}' is not valid UTF-8: {e}", set_error=True)
+            return False
+        for pick in (lambda n: n >= 3, lambda n: n == 2):
+            for l in raw_lines:
+                if pick(len(l.rstrip('\r\n').split('\t'))):
+                    self.imp_label(l)
+        return True
+
+    def _interactive(self):
+        """ソースを与えない対話モード（`?` でラベル表、EOF で終わり）。"""
+        st = self.state
+        st.pc = 0
+        st.relax.pas = 0
+        st.ln = 1
+        st.current_file = "(stdin)"
+        while True:
+            self.printaddr(st.pc)
+            try:
+                line = input(">> ")
+            except EOFError:
+                break
+            line = line.strip()
+            if line == "":
+                continue
+            if line == "?":
+                self.label_manager.printlabels()
+                continue
+            self.lineassemble0(line)
+
+    def _close_last_section(self):
+        """ファイルの終わりで、開いたままのセクションの大きさを確定する。"""
+        st = self.state
+        _last_sec = st.current_section
+        if _last_sec in st.sections:
+            _e = st.sections[_last_sec]
+            _entry_pc = _e[2]
+            _block = st.pc - _entry_pc
+            if _block > 0:
+                _e[1] += _block
+                st.section_ranges.append((_last_sec, _entry_pc, _block))
+
+    def _begin_pass(self, pas):
+        """パスの初めに、ソースの先頭から効くものを戻す。"""
+        st = self.state
+        st.pc = 0
+        st.relax.pas = pas
+        st.ln = 1
+        # ソースの `.reloctype` と `.labelc` はパスごとに先頭から効く
+        # （前のパスの最後の設定を持ち越さない。caxx.c と同じ）。
+        st.elf.reloctype_override = {}
+        st.lwordchars = DIGIT + ALPHABET + "_."
+        st.sections = {}
+        st.current_section = '.text'
+        st.section_ranges = []
+
+    _MAX_RELAX = 16
+
+    def _pass1(self, sourcefile):
+        """パス1: 全ラベルの番地が前回と一致するまでアセンブルを繰り返す（収束で真、中断で偽）。
+
+        最大 _MAX_RELAX (16) 回。各反復の終わりの「ラベル → (番地, セクション)」が前回と同じなら
+        収束、過去の写しと同じなら振動として中断する（誤った番地のコードは出さない）。
+        """
+        st = self.state
+        rx = st.relax
+        rx.pass1_prev_label_pcs = _RELAXATION_SENTINEL
+        rx.relax_prev_values = {}
+        rx.relax_optimistic = False
+
+        _seen_pcs_history = {}
+        _imported_labels = dict(st.labels)
+        _initial_vars = dict(st.vars)
+        _initial_vars_undef = dict(st.vars_undef)
+        _initial_vars_float = dict(st.vars_float)
+
+        # 前の反復から値の変わったラベルの数が最小を更新した反復は上限に
+        # 数えない。前方参照の `.equ` の連鎖は反復ごとに 1 段ずつ決まるので、
+        # 16 段を超える連鎖でも動くラベルが減っている限り回す。その数は
+        # 有限なので必ず止まる。振動では減らないので、従来どおり上限で止まる。
+        # caxx.c の main() の relax_budget / min_moving と同じ規則である。
+        _relax_budget = self._MAX_RELAX
+        _min_moving = None
+        relax_iter = 0
+        while relax_iter < _relax_budget:
+            rx.relax_optimistic = (relax_iter == 0)
+            st._macro_line_pcs_cur = {}
+            self._begin_pass(1)
+            st.labels = dict(_imported_labels)
+            st.export_labels = {}
+            st.symbols = dict(st.patsymbols)
+            st.vars = dict(_initial_vars)
+            st.vars_undef = dict(_initial_vars_undef)
+            st.vars_float = dict(_initial_vars_float)
+            self.fileassemble(sourcefile)
+            self._close_last_section()
+
+            current_pcs = {k: (v[0], v[1]) for k, v in st.labels.items()}
+            _prev_pcs = rx.pass1_prev_label_pcs
+            if isinstance(_prev_pcs, dict):
+                _n_moving = sum(
+                    1 for k, (pc, _sec) in current_pcs.items()
+                    if _is_undef_derived(pc) or k not in _prev_pcs
+                    or _prev_pcs[k][0] != pc)
+                # 0 は前の反復と同じ値（収束）なので、下の検出に任せる。
+                if _n_moving and (_min_moving is None or _n_moving < _min_moving):
+                    if _min_moving is not None:
+                        _relax_budget += 1
+                        # 振動の検出に使う履歴はここから取り直す。振動が
+                        # 続くなら動く数は減らないので、次の周で見つかる。
+                        # 履歴が反復の数だけ膨らむのも防ぐ。
+                        _seen_pcs_history.clear()
+                    _min_moving = _n_moving
+            has_undef = any(
+                _is_undef_derived(pc)
+                for k, (pc, _sec) in current_pcs.items()
+                if not st.labels[k][2]
+            )
+
+            rx.relax_prev_values = {
+                k: v[0] for k, v in st.labels.items()
+                if not _is_undef_derived(v[0])
+            }
+
+            st._macro_label_values = dict(rx.relax_prev_values)
+            st._macro_label_names = set(st.labels)
+            st._macro_line_pcs = dict(st._macro_line_pcs_cur)
+            if not has_undef:
+                _pcs_key = frozenset(current_pcs.items())
+                _first_seen = _seen_pcs_history.get(_pcs_key)
+                if _first_seen is not None:
+                    _cycle_len = (relax_iter + 1) - _first_seen
+                    if _cycle_len == 1:
+                        if st.debug:
+                            print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
+                        break
+                    st.diag(f" error - Pass1 relaxation is oscillating with period "
+                            f"{_cycle_len} (the instruction layout at iteration "
+                            f"{relax_iter + 1} is identical to iteration {_first_seen}); "
+                            f"it will never converge by simple repetition.", set_error=False, force=True)
+                    print("         Aborting: no output file written.", file=sys.stderr)
+                    return False
+                _seen_pcs_history[_pcs_key] = relax_iter + 1
+            rx.pass1_prev_label_pcs = current_pcs
+            relax_iter += 1
+        else:
+            st.diag(" error - Pass1 relaxation did not converge after {0} iterations.".format(_relax_budget), set_error=False, force=True)
+            print("         Generated code would have incorrect addresses for", file=sys.stderr)
+            print("         variable-length instructions with forward references.", file=sys.stderr)
+            print("         Aborting: no output file written.", file=sys.stderr)
+            if isinstance(rx.pass1_prev_label_pcs, dict):
+                changed = [k for k in current_pcs
+                           if k in rx.pass1_prev_label_pcs
+                           and current_pcs[k] != rx.pass1_prev_label_pcs[k]]
+                if changed:
+                    print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
+            return False
+
+        rx.relax_optimistic = False
+        return True
+
+    def _pass2(self, sourcefile, pass1_addrs):
+        """パス2: 確定した番地で 1 回だけ回す。パス1の番地 pass1_addrs と食い違えばエラー（偽）。"""
+        st = self.state
+        self._begin_pass(2)
+        st.elf.relocations = []
+        st.elf.anchors = []
+        st.elf.line_map = []
+        self.fileassemble(sourcefile)
+        self._close_last_section()
+
+        _drift = []
+        for k, p2 in ((kk, vv[0]) for kk, vv in st.labels.items() if not vv[2]):
+            p1 = pass1_addrs.get(k)
+            if p1 is not None and p1 != p2 and not _is_undef_derived(p2):
+                _drift.append((k, p1, p2))
+        if _drift:
+            st.diag(" error - address mismatch between pass1 and pass2 "
+                    f"({len(_drift)} label(s)); output addresses are "
+                    f"UNRELIABLE.", set_error=False, force=True)
+            if st.reported_label_errors:
+                print("         This is a consequence of the label definition "
+                      "error(s) reported above; fix those first.", file=sys.stderr)
+            elif st.had_error:
+                # 誤りのある行は pass2 で何も出さないので、その後ろの番地がずれる。
+                # リラクゼーションのせいではない。caxx.c と同じ文面。
+                print("         This is a consequence of the error(s) reported above "
+                      "(a line in error emits nothing, so the addresses after it "
+                      "move); fix those first.", file=sys.stderr)
+            else:
+                print("         This usually means pass1 relaxation did not fully "
+                      "converge for variable-length forward references.", file=sys.stderr)
+            for k, p1, p2 in _drift[:10]:
+                try:
+                    print(f"           {k}: pass1=0x{int(p1):X} pass2=0x{int(p2):X}",
+                          file=sys.stderr)
+                except (TypeError, ValueError):
+                    print(f"           {k}: pass1={p1!r} pass2={p2!r}", file=sys.stderr)
+            if len(_drift) > 10:
+                print(f"           ... and {len(_drift) - 10} more.", file=sys.stderr)
+            print("         Aborting: no output file written.", file=sys.stderr)
+            return False
+
+        if st.had_error:
+            st.diag(" error - one or more errors were reported during assembly; "
+                    "output would be incomplete or wrong.", set_error=False, force=True)
+            print("         Aborting: no output file written.", file=sys.stderr)
+            return False
+        return True
+
+    def _assemble(self, sourcefile):
+        """ソースをパス1（リラクゼーション）とパス2で通す。中断なら偽。"""
+        if not self._pass1(sourcefile):
+            return False
+        _pass1_final_addrs = {k: v[0] for k, v in self.state.labels.items() if not v[2]}
+        return self._pass2(sourcefile, _pass1_final_addrs)
+
+    def _write_export(self, path, elf):
+        """`-e` / `-E` のラベル TSV を書く（elf が 1 なら ELF 形式: セクションのフラグと型付き）。"""
+        st = self.state
+        h = list(st.export_labels.items())
+        key = list(st.sections.keys())
+        _bpw_export = max(1, (st.bts + 7) // 8)
+        with open(path, 'wt', encoding="utf-8") as label_file:
+            for i in key:
+                if i == '.text' and elf == 1:
+                    flag = 'AX'
+                elif i == '.data' and elf == 1:
+                    flag = 'WA'
+                else:
+                    flag = ''
+
+                ranges = [(rs, rl) for (rn, rs, rl) in st.section_ranges if rn == i]
+                if not ranges:
+                    ranges = [(st.sections[i][0], st.sections[i][1])]
+                for (w_start, w_count) in ranges:
+                    try:
+                        byte_start = int(w_start) * _bpw_export
+                        byte_size = int(w_count) * _bpw_export
+                    except (OverflowError, ValueError, TypeError):
+                        byte_start = 0
+                        byte_size = 0
+                    label_file.write(
+                        f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
+                    )
+            for i in h:
+                lbl_is_equ = i[1][2]
+                lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
+                if _is_undef_derived(i[1][0]):
+                    continue
+                try:
+                    lbl_addr = int(lbl_addr_raw)
+                except (OverflowError, ValueError, TypeError):
+                    lbl_addr = 0
+
+                reloc_type_str = ''
+                if elf == 1:
+                    lentry = st.labels.get(i[0], [])
+                    if _lbl_rtype(lentry) is not None:
+                        reloc_type_str = _reloc_reverse(st, elf_machine_table(st), lentry[4])
+                        if reloc_type_str:
+                            reloc_type_str = f'::{reloc_type_str}'
+
+                label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
+
+    def _write_outputs(self):
+        """-b / -o / -e / -E の出力を書く（書けなければ偽）。"""
+        st = self.state
+        self.binary_writer.flush()
+
+        if st.had_error:
+            return False
+
+        if st.elf.objfile:
+            try:
+                self.write_elf_obj(st.elf.objfile, st.elf.machine)
+            except OSError as _we:
+                st.diag(f" error - cannot write '{st.elf.objfile}': {_we}", set_error=True)
+            if st.had_error:
+                st.diag(" error - one or more errors were reported during assembly; "
+                        "output would be incomplete or wrong.", set_error=False, force=True)
+                print("         Aborting: no output file written.", file=sys.stderr)
+                return False
+
+        if st.expfile_elf and st.expfile:
+            print(f"warning: both -e '{st.expfile}' and -E '{st.expfile_elf}' specified; "
+                  f"exporting plain format to -e and ELF format to -E separately.",
+                  file=sys.stderr)
+
+        for _exp_path, _exp_elf in ((st.expfile, 0), (st.expfile_elf, 1)):
+            if not _exp_path:
+                continue
+            try:
+                self._write_export(_exp_path, elf=_exp_elf)
+            except OSError as _we:
+                st.diag(f" error - cannot write '{_exp_path}': {_we}", set_error=True)
+                return False
+        return True
+
+    def run(self):
+        """入口。引数を読み、パターンとソースを読み、出力を書く（成功なら真）。"""
+        ap = self._build_arg_parser()
+        if len(sys.argv) == 1:
+            ap.print_help()
+            return True
+        args = ap.parse_args(self._normalise_macro_expand_argv(sys.argv[1:]))
+        if not self._apply_args(args):
+            return False
 
         if args.macro_expand_pattern is not None:
-            return self._pat_macro_expand_only(args.patternfile,
-                                               args.macro_expand_pattern)
-
+            return self._expand_only(self.pat_macro_proc, args.patternfile,
+                                     args.macro_expand_pattern, 'pattern')
         if args.macro_expand is not None:
             if args.sourcefile is None:
                 self.state.diag(" error - -P/--macro-expand needs a source file.", set_error=False, force=True)
                 return False
-            return self._macro_expand_only(args.sourcefile, args.macro_expand)
+            return self._expand_only(self.macro_proc, args.sourcefile, args.macro_expand, 'source')
 
         try:
-            self.state.pat = self.pattern_reader.readpat(args.patternfile)
-            self.state.pat_isdir = [_pat_is_directive(_p) for _p in self.state.pat]
-            (self.state.pat_index,
-             self.state.pat_always,
-             self.state.pat_maxkey) = _build_pat_index(self.state.pat,
-                                                       self.state.pat_isdir)
-            (self.state.hoist_rows,
-             self.state.hoist_fields) = _pat_hoist_scan(self.state.pat,
-                                                        self.state.pat_isdir)
-            self.state.hoist_first_ai = sum(
-                1 for _r in self.state.pat_always if _r < self.state.hoist_rows)
-            _dirorder = _pat_unordered_plan(self.state.pat, self.state.pat_isdir)
-            self.state.unordered = _dirorder is not None
-            self.state.pat_dirorder = _dirorder or []
-            if self.state.unordered:
-                self.state.pat_always = [_r for _r in self.state.pat_always
-                                         if not self.state.pat_isdir[_r]]
-                self.state.hoist_rows = 0
-                self.state.hoist_first_ai = 0
-            self.state.pat_dirfn = self._build_dir_dispatch(self.state.pat,
-                                                            self.state.pat_isdir)
-            self.state.sub_defs = self.pattern_reader.subs
-            self.state.func_defs = self.pattern_reader.funcs
-            if self.state.had_error:
-                self.state.diag(" error - one or more errors were reported during assembly; "
-                                "output would be incomplete or wrong.",
-                                set_error=False, force=True)
-                self.state.diag("         Aborting: no output file written.",
-                                set_error=False, force=True)
-                return False
-            if self.state.unordered:
-                self.setpatsymbols([self.state.pat[_r] for _r in self.state.pat_dirorder])
-            else:
-                self.setpatsymbols(self.state.pat)
-            self.register_elfdecls(self.state.pat)
-            if self.state.had_error:
-                self.state.diag(" error - one or more errors were reported while reading "
-                                "the pattern file; output would be incomplete or wrong.",
-                                set_error=False, force=True)
-                self.state.diag("         Aborting: no output file written.",
-                                set_error=False, force=True)
+            if not self._load_pattern(args.patternfile):
                 return False
             if args.elf_desc:
                 sys.stdout.write(self.elf_desc_text())
                 return True
-
-            if self.state.impfile:
-
-                try:
-                    with open(self.state.impfile, 'rt', encoding="utf-8",
-                              errors="surrogateescape") as label_file:
-                        raw_lines = label_file.readlines()
-                except OSError as e:
-                    self.state.diag(f" error - cannot open import file "
-                                    f"'{self.state.impfile}': {e}", set_error=True)
-                    return False
-                except UnicodeDecodeError as e:
-                    self.state.diag(f" error - import file "
-                                    f"'{self.state.impfile}' is not valid UTF-8: {e}", set_error=True)
-                    return False
-                for l in raw_lines:
-                    fields = l.rstrip('\r\n').split('\t')
-                    if len(fields) >= 3:
-                        self.imp_label(l)
-                for l in raw_lines:
-                    fields = l.rstrip('\r\n').split('\t')
-                    if len(fields) == 2:
-                        self.imp_label(l)
-
-
-            if args.sourcefile is None:
-                self.state.pc = 0
-                self.state.relax.pas = 0
-                self.state.ln = 1
-                self.state.current_file = "(stdin)"
-                while True:
-                    self.printaddr(self.state.pc)
-                    try:
-                        line = input(">> ")
-                    except EOFError:
-                        break
-                    line = line.strip()
-                    if line == "":
-                        continue
-                    if line == "?":
-                        self.label_manager.printlabels()
-                        continue
-                    self.lineassemble0(line)
-            else:
-
-                MAX_RELAX = 16
-                self.state.relax.pass1_prev_label_pcs = _RELAXATION_SENTINEL
-                self.state.relax.relax_prev_values = {}
-                self.state.relax.relax_optimistic = False
-
-                _seen_pcs_history = {}
-
-                _imported_labels = dict(self.state.labels)
-
-                _initial_vars = dict(self.state.vars)
-                _initial_vars_undef = dict(self.state.vars_undef)
-                _initial_vars_float = dict(self.state.vars_float)
-
-                # 前の反復から値の変わったラベルの数が最小を更新した反復は上限に
-                # 数えない。前方参照の `.equ` の連鎖は反復ごとに 1 段ずつ決まるので、
-                # 16 段を超える連鎖でも動くラベルが減っている限り回す。その数は
-                # 有限なので必ず止まる。振動では減らないので、従来どおり上限で止まる。
-                # caxx.c の main() の relax_budget / min_moving と同じ規則である。
-                _relax_budget = MAX_RELAX
-                _min_moving = None
-                relax_iter = 0
-                while relax_iter < _relax_budget:
-                    self.state.relax.relax_optimistic = (relax_iter == 0)
-                    self.state._macro_line_pcs_cur = {}
-                    self.state.pc = 0
-                    self.state.relax.pas = 1
-                    self.state.ln = 1
-                    # ソースの `.reloctype` と `.labelc` はパスごとに先頭から効く
-                    # （前のパスの最後の設定を持ち越さない。caxx.c と同じ）。
-                    self.state.elf.reloctype_override = {}
-                    self.state.lwordchars = DIGIT + ALPHABET + "_."
-                    self.state.labels = dict(_imported_labels)
-                    self.state.sections = {}
-                    self.state.export_labels = {}
-                    self.state.current_section = '.text'
-                    self.state.symbols = dict(self.state.patsymbols)
-                    self.state.vars = dict(_initial_vars)
-                    self.state.vars_undef = dict(_initial_vars_undef)
-                    self.state.vars_float = dict(_initial_vars_float)
-                    self.state.section_ranges = []
-                    self.fileassemble(args.sourcefile)
-
-                    _last_sec1 = self.state.current_section
-                    if _last_sec1 in self.state.sections:
-                        _e1 = self.state.sections[_last_sec1]
-                        _ep1 = _e1[2] if len(_e1) > 2 else _e1[0]
-                        _blk1 = self.state.pc - _ep1
-                        if _blk1 > 0:
-                            _e1[1] += _blk1
-                            self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
-
-                    current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
-                    _prev_pcs = self.state.relax.pass1_prev_label_pcs
-                    if isinstance(_prev_pcs, dict):
-                        _n_moving = sum(
-                            1 for k, (pc, _sec) in current_pcs.items()
-                            if _is_undef_derived(pc) or k not in _prev_pcs
-                            or _prev_pcs[k][0] != pc)
-                        # 0 は前の反復と同じ値（収束）なので、下の検出に任せる。
-                        if _n_moving and (_min_moving is None or _n_moving < _min_moving):
-                            if _min_moving is not None:
-                                _relax_budget += 1
-                                # 振動の検出に使う履歴はここから取り直す。振動が
-                                # 続くなら動く数は減らないので、次の周で見つかる。
-                                # 履歴が反復の数だけ膨らむのも防ぐ。
-                                _seen_pcs_history.clear()
-                            _min_moving = _n_moving
-                    has_undef = any(
-                        _is_undef_derived(pc)
-                        for k, (pc, _sec) in current_pcs.items()
-                        if not (len(self.state.labels[k]) > 2 and self.state.labels[k][2])
-                    )
-
-                    self.state.relax.relax_prev_values = {
-                        k: v[0] for k, v in self.state.labels.items()
-                        if not _is_undef_derived(v[0])
-                    }
-
-                    self.state._macro_label_values = dict(self.state.relax.relax_prev_values)
-                    self.state._macro_label_names = set(self.state.labels)
-                    self.state._macro_line_pcs = dict(self.state._macro_line_pcs_cur)
-                    if not has_undef:
-                        _pcs_key = frozenset(current_pcs.items())
-                        _first_seen = _seen_pcs_history.get(_pcs_key)
-                        if _first_seen is not None:
-                            _cycle_len = (relax_iter + 1) - _first_seen
-                            if _cycle_len == 1:
-                                if self.state.debug:
-                                    print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
-                                break
-                            else:
-                                self.state.diag(f" error - Pass1 relaxation is oscillating with period "
-                                     f"{_cycle_len} (the instruction layout at iteration "
-                                     f"{relax_iter + 1} is identical to iteration {_first_seen}); "
-                                     f"it will never converge by simple repetition.", set_error=False, force=True)
-                                print("         Aborting: no output file written.", file=sys.stderr)
-                                return False
-                        _seen_pcs_history[_pcs_key] = relax_iter + 1
-                    self.state.relax.pass1_prev_label_pcs = current_pcs
-                    relax_iter += 1
-                else:
-
-                    self.state.diag(" error - Pass1 relaxation did not converge after {0} iterations.".format(_relax_budget), set_error=False, force=True)
-                    print("         Generated code would have incorrect addresses for", file=sys.stderr)
-                    print("         variable-length instructions with forward references.", file=sys.stderr)
-                    print("         Aborting: no output file written.", file=sys.stderr)
-                    if isinstance(self.state.relax.pass1_prev_label_pcs, dict):
-                        changed = []
-                        for k in current_pcs:
-                            if k in self.state.relax.pass1_prev_label_pcs:
-                                if current_pcs[k] != self.state.relax.pass1_prev_label_pcs[k]:
-                                    changed.append(k)
-                        if changed:
-                            print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
-                    return False
-
-                self.state.relax.relax_optimistic = False
-
-                _pass1_final_addrs = {
-                    k: v[0] for k, v in self.state.labels.items()
-                    if not (len(v) > 2 and v[2])
-                }
-
-                self.state.pc = 0
-                self.state.relax.pas = 2
-                self.state.ln = 1
-                self.state.elf.reloctype_override = {}
-                self.state.lwordchars = DIGIT + ALPHABET + "_."
-                self.state.elf.relocations = []
-                self.state.elf.anchors = []
-                self.state.elf.line_map = []
-                self.state.sections = {}
-                self.state.current_section = '.text'
-                self.state.section_ranges = []
-                self.fileassemble(args.sourcefile)
-
-                _last_sec = self.state.current_section
-                if _last_sec in self.state.sections:
-                    _e = self.state.sections[_last_sec]
-                    _entry_pc = _e[2] if len(_e) > 2 else _e[0]
-                    _block = self.state.pc - _entry_pc
-                    if _block > 0:
-                        _e[1] += _block
-                        self.state.section_ranges.append((_last_sec, _entry_pc, _block))
-
-                _drift = []
-                for k, p2 in ((kk, vv[0]) for kk, vv in self.state.labels.items()
-                              if not (len(vv) > 2 and vv[2])):
-                    p1 = _pass1_final_addrs.get(k)
-                    if p1 is not None and p1 != p2 and not _is_undef_derived(p2):
-                        _drift.append((k, p1, p2))
-                if _drift:
-                    self.state.diag(" error - address mismatch between pass1 and pass2 "
-                                    f"({len(_drift)} label(s)); output addresses are "
-                                    f"UNRELIABLE.", set_error=False, force=True)
-                    if self.state.reported_label_errors:
-                        print("         This is a consequence of the label definition "
-                              "error(s) reported above; fix those first.", file=sys.stderr)
-                    elif self.state.had_error:
-                        # 誤りのある行は pass2 で何も出さないので、その後ろの番地がずれる。
-                        # リラクゼーションのせいではない。caxx.c と同じ文面。
-                        print("         This is a consequence of the error(s) reported above "
-                              "(a line in error emits nothing, so the addresses after it "
-                              "move); fix those first.", file=sys.stderr)
-                    else:
-                        print("         This usually means pass1 relaxation did not fully "
-                              "converge for variable-length forward references.", file=sys.stderr)
-                    for k, p1, p2 in _drift[:10]:
-                        try:
-                            print(f"           {k}: pass1=0x{int(p1):X} pass2=0x{int(p2):X}",
-                                  file=sys.stderr)
-                        except (TypeError, ValueError):
-                            print(f"           {k}: pass1={p1!r} pass2={p2!r}", file=sys.stderr)
-                    if len(_drift) > 10:
-                        print(f"           ... and {len(_drift) - 10} more.", file=sys.stderr)
-                    print("         Aborting: no output file written.", file=sys.stderr)
-                    return False
-
-                if self.state.had_error:
-                    self.state.diag(" error - one or more errors were reported during assembly; "
-                         "output would be incomplete or wrong.", set_error=False, force=True)
-                    print("         Aborting: no output file written.", file=sys.stderr)
-                    return False
-
-            self.binary_writer.flush()
-
-            if self.state.had_error:
+            if self.state.impfile and not self._import_labels(self.state.impfile):
                 return False
-
-            if self.state.elf.objfile:
-                try:
-                    self.write_elf_obj(self.state.elf.objfile, self.state.elf.machine)
-                except OSError as _we:
-                    self.state.diag(f" error - cannot write "
-                                    f"'{self.state.elf.objfile}': {_we}", set_error=True)
-                if self.state.had_error:
-                    self.state.diag(" error - one or more errors were reported during assembly; "
-                         "output would be incomplete or wrong.", set_error=False, force=True)
-                    print("         Aborting: no output file written.", file=sys.stderr)
-                    return False
-
-            if self.state.expfile_elf and self.state.expfile:
-                print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "
-                      f"exporting plain format to -e and ELF format to -E separately.",
-                      file=sys.stderr)
-
-            def _write_export(path, elf):
-                h   = list(self.state.export_labels.items())
-                key = list(self.state.sections.keys())
-                _bpw_export = max(1, (self.state.bts + 7) // 8)
-                with open(path, 'wt', encoding="utf-8") as label_file:
-                    for i in key:
-                        if i == '.text' and elf == 1:
-                            flag = 'AX'
-                        elif i == '.data' and elf == 1:
-                            flag = 'WA'
-                        else:
-                            flag = ''
-
-                        ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == i]
-                        if not ranges:
-                            ranges = [(self.state.sections[i][0], self.state.sections[i][1])]
-                        for (w_start, w_count) in ranges:
-                            try:
-                                byte_start = int(w_start) * _bpw_export
-                                byte_size  = int(w_count) * _bpw_export
-                            except (OverflowError, ValueError, TypeError):
-                                byte_start = 0
-                                byte_size  = 0
-                            label_file.write(
-                                f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
-                            )
-                    for i in h:
-                        lbl_is_equ = len(i[1]) > 2 and i[1][2]
-                        lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
-                        if _is_undef_derived(i[1][0]):
-                            continue
-                        try:
-                            lbl_addr = int(lbl_addr_raw)
-                        except (OverflowError, ValueError, TypeError):
-                            lbl_addr = 0
-
-                        reloc_type_str = ''
-                        if elf == 1:
-                            lentry = self.state.labels.get(i[0], [])
-                            if len(lentry) > 4 and lentry[4] is not None:
-                                _mach_tbl_exp = elf_machine_table(self.state)
-                                reloc_type_str = _reloc_reverse(self.state, _mach_tbl_exp, lentry[4])
-                                if reloc_type_str:
-                                    reloc_type_str = f'::{reloc_type_str}'
-
-                        label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
-
-            for _exp_path, _exp_elf in ((self.state.expfile, 0),
-                                        (self.state.expfile_elf, 1)):
-                if not _exp_path:
-                    continue
-                try:
-                    _write_export(_exp_path, elf=_exp_elf)
-                except OSError as _we:
-                    self.state.diag(f" error - cannot write '{_exp_path}': {_we}",
-                                    set_error=True)
-                    return False
-
+            if args.sourcefile is None:
+                self._interactive()
+            elif not self._assemble(args.sourcefile):
+                return False
+            return self._write_outputs()
         finally:
             if self.state.stdin_tmp_path and os.path.exists(self.state.stdin_tmp_path):
                 try:
@@ -13904,8 +13764,6 @@ class Assembler:
                 except OSError:
                     pass
                 self.state.stdin_tmp_path = None
-
-        return True
 
 
 class _StdoutGuard:
