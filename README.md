@@ -84,9 +84,9 @@ Put string templates in the output field and declare `.textmode`, and a pattern 
 
 The `.vliw` declaration handles VLIW machines, including Itanium-style EPIC. Word sizes from 1 to 64 bits are set with `.bits::12` and the like, covering bit-slice and 4-bit machines. Floating-point immediates from half to quad precision use `!F` / `!D` / `!Q`.
 
-### Any processor, as long as its ISA is a finite static transformation
+### Any processor, as long as its ISA is a one-to-one finite static transformation
 
-For an imperative assembly language, axx can process the assembly of any processor whose ISA is a *generic processor ISA*: one where the mapping from assembly to machine code is a **finite static transformation**. *Static* means each line's encoding is decided at assembly time from the line's text, the pattern-file declarations and the label values, not from run-time state. *Finite* means finitely many instruction forms, a finite word sequence per line, and an encoding computation that finishes. Each condition maps onto an axx mechanism: one pattern line per form, specificity scoring, `error_patterns`, expressions and the Turing-complete mini language for the encoding, and relaxation for label-dependent lengths. Section 1.7 of `Technical_Manual.md` states the thesis and gives a checklist.
+For an imperative assembly language, axx can process the assembly of any processor whose ISA is a *generic processor ISA*: one where the mapping from assembly to machine code is **one-to-one** and a **finite static transformation**. *One-to-one* means each instruction line corresponds to exactly one piece of machine code, and each piece comes from exactly one line. *Static* means each line's encoding is decided at assembly time from the line's text, the pattern-file declarations and the label values, not from run-time state. *Finite* means finitely many instruction forms, a finite word sequence per line, and an encoding computation that finishes. Each condition maps onto an axx mechanism: one chosen pattern and one word sequence per line, one pattern line per form, specificity scoring, `error_patterns`, expressions and the Turing-complete mini language for the encoding, and relaxation for label-dependent lengths. Section 1.7 of `Technical_Manual.md` states the thesis and gives a checklist.
 
 ### A formal foundation
 

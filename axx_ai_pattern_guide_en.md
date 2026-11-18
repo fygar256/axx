@@ -82,7 +82,7 @@ MOV A,B  :: 0xBB
 
 A person first decides what to build, in which syntax and in which order. Leaving this vague and handing it to the AI leaves no fixed standard for the comparison, and costs rework.
 
-Before that, confirm that the target ISA is a **generic processor ISA**: one whose mapping from assembly to machine code is a finite static transformation. For an imperative assembly language whose instructions map one-to-one onto machine code, axx can build an assembler when every question below is answered "yes" (section 1.7 of the technical manual).
+Before that, confirm that the target ISA is a **generic processor ISA**: one whose mapping from assembly to machine code is one-to-one and a finite static transformation. For an imperative assembly language whose instructions map one-to-one onto machine code, axx can build an assembler when every question below is answered "yes" (section 1.7 of the technical manual).
 
 - Can the ways of writing instructions be listed as a table of finitely many forms?
 - Is the machine code of each instruction decided by its text and the label values alone (not by run-time state)?

@@ -187,8 +187,9 @@ basic model does not cover, and are handled by a later extension — see
 [section 4](#4-vliw-and-epic-processors).
 
 The "one-to-one" condition above, restated generally as a property of the ISA,
-is the *finite static transformation* of
-[section 1.7](#17-the-generality-thesis-any-processor-whose-isa-is-a-finite-static-transformation).
+is the condition of
+[section 1.7](#17-the-generality-thesis-any-processor-whose-isa-is-a-one-to-one-finite-static-transformation)
+that the mapping is *one-to-one and a finite static transformation*.
 
 ### 1.4 Where axx sits relative to other tools
 
@@ -255,13 +256,14 @@ in section 2.4). Ordinary von Neumann processors rarely come near any of them.
   quadruple precision). IBM hexadecimal floating point and VAX formats cannot be emitted
   by the built-in directives. This is a limit on data definitions, not on instructions.
 
-### 1.7 The generality thesis: any processor whose ISA is a finite static transformation
+### 1.7 The generality thesis: any processor whose ISA is a one-to-one finite static transformation
 
 The condition of section 1.3, that instructions map one-to-one onto machine
 code, can be stated in a general form:
 
 > **Thesis.** If an ISA has an imperative assembly language and the mapping
-> from its assembly to machine code is a **finite static transformation** —
+> from its assembly to machine code is **one-to-one** and a **finite static
+> transformation** —
 > call such an ISA a **generic processor ISA** — then axx can process the
 > assembly of that processor, whichever processor it is. Write a pattern file
 > that describes the ISA, and you have an assembler for that processor.
@@ -272,6 +274,12 @@ An **imperative assembly language** is one whose source is a sequence of lines
 (instructions, directives, labels), each instruction line standing for a piece
 of machine code. It need not be mnemonic-plus-operands; assignment forms such
 as `r1 = r2 + r3` are fine (section 1.2).
+
+The mapping from assembly to machine code is **one-to-one** when each
+instruction line corresponds to exactly one piece of machine code (a sequence
+of words) and each piece comes from exactly one instruction line. A line is
+not expanded into a sequence of several instructions as a structured construct
+would be, and several lines do not combine into one piece of machine code.
 
 The mapping from assembly to machine code is a **finite static
 transformation** when it is both of the following.
@@ -310,8 +318,9 @@ processor ISAs when they meet the same conditions with the bundle as the unit
 
 Each item of the definition corresponds directly to a mechanism in axx.
 
-| Condition of a finite static transformation | The axx mechanism that handles it |
+| Condition of one-to-one and a finite static transformation | The axx mechanism that handles it |
 |---|---|
+| Each line corresponds to one piece of machine code | One pattern is chosen per line, and its `binary_list` is emitted as one sequence of words |
 | Finitely many instruction forms | One form is one pattern line, `instruction :: error_patterns :: binary_list`. Matching is character by character, so the pattern decides how the syntax is split (section 3.3) |
 | Several forms may match the same line | Every matching pattern gets the specificity score `(n_expr, -n_lit, n_sym)` and the smallest wins, independent of the order of writing (section 3.2) |
 | Ranges and constraints on operand values | Conditions in `error_patterns`; register-class constraints with `.check`, `.map` and sets (sections 3.4, 3.7) |
@@ -325,7 +334,7 @@ in Caxx) matches every candidate pattern against a line, evaluates the
 `error_patterns` of the best one, and then turns its `binary_list` into words.
 That is exactly a function from "the text of the line, the declarations and
 the label environment" to "a finite sequence of words", the same shape as the
-definition of a finite static transformation. The dependence on labels is
+definition of a one-to-one finite static transformation. The dependence on labels is
 solved by the relaxation loop in `Assembler.run()`, which treats the layout as
 converged once it equals that of the previous iteration.
 
@@ -342,7 +351,7 @@ AVX-512), AArch64 (through SVE/SME2), Power ISA v3.1, all of RISC-V RV64, MIPS,
 SPARC and Itanium-style EPIC, are concrete instances of the thesis.
 
 The same holds when the output is text. If rewriting one assembly language
-into another is a finite static transformation, writing string templates in
+into another is one-to-one and a finite static transformation, writing string templates in
 `binary_list` and declaring `.textmode` gives that translator (section 3.18).
 
 Section 14.1 of `axxsemantics.md` (in Japanese) restates the thesis in terms
@@ -352,6 +361,8 @@ of the meaning function and sketches how the pattern file is constructed.
 
 Whether an ISA fits the definition can be checked with these questions:
 
+- Can each instruction line be made to correspond to exactly one piece of
+  machine code?
 - Can the ways of writing instructions be listed as a table of finitely many
   forms?
 - Can the machine code of each instruction be decided from the text of that
