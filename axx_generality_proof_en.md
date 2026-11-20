@@ -37,7 +37,7 @@ The encoding is a partial function from a line and an environment to a sequence 
 
 The type of the encoding is:
 
-```latex
+```math
 f : \mathit{Line} \times \mathit{Env} \rightharpoonup W^{*}, \qquad W = \{0,1,\dots,2^{w}-1\},\ 1 \le w \le 64
 ```
 
@@ -58,7 +58,7 @@ The proof rests on six assumptions. H3 restates "static" and "finite" in axx's o
 
 The formula of H3:
 
-```latex
+```math
 \forall \ell \in M_{t_i} \cap \operatorname{dom} f,\ \forall \sigma :\quad f(\ell,\sigma) = g_i\bigl(\mathit{sp}_{t_i}(\ell),\ v_{t_i}(\ell,\sigma),\ \sigma(\$\$)\bigr)
 ```
 
@@ -68,7 +68,7 @@ For each form, H3 covers every line that form accepts. This quantification is th
 
 **Theorem.** For every f satisfying H1–H5 there is a pattern file P_f with the following property. For every source S whose instruction lines all lie in dom f and for which H6 holds:
 
-```latex
+```math
 \mathrm{axx}(P_f,\ S,\ \texttt{-b}) \;=\; f^{*}(S) \;=\; f(\ell_1,\sigma^{*})\, f(\ell_2,\sigma^{*}) \cdots f(\ell_n,\sigma^{*})
 ```
 
@@ -139,7 +139,7 @@ By H6, in some iteration r the label table T_r equals the previous table T_{r−
 2. Hence both the current values of earlier labels and the previous values of later labels are σ*: for every k, σ_{r,k} = σ*.
 3. By Lemma 2 the length of each line in iteration r is |f(ℓ_k, σ*)|. So the formula below holds for every label L, and σ* is a fixed point of the layout equation. The value of each `.equ` is likewise its expression evaluated under σ*.
 
-```latex
+```math
 \sigma^{*}(L) \;=\; \mathit{origin} + \sum_{k < \mathrm{pos}(L)} \bigl|\, f(\ell_k, \sigma^{*}) \,\bigr|
 ```
 

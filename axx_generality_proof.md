@@ -37,7 +37,7 @@
 
 符号化の型は次のとおりである。
 
-```latex
+```math
 f : \mathit{Line} \times \mathit{Env} \rightharpoonup W^{*}, \qquad W = \{0,1,\dots,2^{w}-1\},\ 1 \le w \le 64
 ```
 
@@ -58,7 +58,7 @@ f : \mathit{Line} \times \mathit{Env} \rightharpoonup W^{*}, \qquad W = \{0,1,\d
 
 H3 の式は次のとおりである。
 
-```latex
+```math
 \forall \ell \in M_{t_i} \cap \operatorname{dom} f,\ \forall \sigma :\quad f(\ell,\sigma) = g_i\bigl(\mathit{sp}_{t_i}(\ell),\ v_{t_i}(\ell,\sigma),\ \sigma(\$\$)\bigr)
 ```
 
@@ -68,7 +68,7 @@ H3 は各形式について、その形式に当たるすべての行を対象�
 
 **定理。** H1〜H5 を満たす f に対して、次の性質を持つパターンファイル P_f が存在する。命令行がすべて dom f に入り、かつ H6 が成り立つソース S について、次の等式が成り立つ。
 
-```latex
+```math
 \mathrm{axx}(P_f,\ S,\ \texttt{-b}) \;=\; f^{*}(S) \;=\; f(\ell_1,\sigma^{*})\, f(\ell_2,\sigma^{*}) \cdots f(\ell_n,\sigma^{*})
 ```
 
@@ -139,7 +139,7 @@ H6 により、ある反復 r でラベル表 T_r が前回の表 T_{r−1} と�
 2. したがって、前のラベルの今回の値も、後ろのラベルの前回の値も σ* である。すべての k について σ_{r,k} = σ* となる。
 3. 補題 2 により、第 r 反復の各行の長さは |f(ℓ_k, σ*)| である。よって各ラベル L について下の式が成り立ち、σ* は配置の方程式の不動点になる。`.equ` の値も、同じ σ* で評価した式の値である。
 
-```latex
+```math
 \sigma^{*}(L) \;=\; \mathit{origin} + \sum_{k < \mathrm{pos}(L)} \bigl|\, f(\ell_k, \sigma^{*}) \,\bigr|
 ```
 
