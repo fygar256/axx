@@ -201,6 +201,7 @@ LLVM の AsmMatcher は、Hexagon のニーモニックのない `r0 = r1` と�
 | AI でパターンファイルを書く | `axx_ai_pattern_guide_en.md` | `axx_ai_pattern_guide_ja.md` |
 | 紹介記事 | — | `axx_promo.md`、[Qiita](https://qiita.com/fygar256/items/1d06fb757ac422796e31) |
 | 表示的意味論 | — | `axxsemantics` |
+| 一般性の命題の証明 | `axx_generality_proof_en.md` | `axx_generality_proof.md` |
 | ファイル一覧 | `FILE_DESCRIPTION` | — |
 | man ページ | `axx.1.gz` | — |
 

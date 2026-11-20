@@ -84,6 +84,15 @@ axx_introduction_paper_en.md        introduction paper (English)
 axx_promo.md                        introductory article, "axx in 30 seconds"
                                     (Japanese)
 axxsemantics                        denotational semantics of axx (Japanese)
+axx_generality_proof.md             proof of the generality proposition
+                                    (manual 1.7, axxsemantics 14.1): axx
+                                    can process any generic processor ISA
+                                    under the stated assumptions H1-H6;
+                                    the mini language is Turing complete,
+                                    each line is right whichever pattern
+                                    is chosen, and pass 1 / pass 2 give
+                                    f* (Japanese)
+axx_generality_proof_en.md          the same (English)
 format_of_exp_imp_file              format of the export / import files
                                     (-e / -E / -i)
 URL_to_newest_article_in_Japanese   URL of the newest article (Japanese)

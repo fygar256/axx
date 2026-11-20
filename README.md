@@ -201,6 +201,7 @@ LLVM's AsmMatcher needed dedicated handling for Hexagon's mnemonic-less `r0 = r1
 | Writing pattern files with AI | `axx_ai_pattern_guide_en.md` | `axx_ai_pattern_guide_ja.md` |
 | Introductory article | — | `axx_promo.md`, [Qiita](https://qiita.com/fygar256/items/1d06fb757ac422796e31) |
 | Denotational semantics | — | `axxsemantics` |
+| Proof of the generality proposition | `axx_generality_proof_en.md` | `axx_generality_proof.md` |
 | File list | `FILE_DESCRIPTION` | — |
 | Man page | `axx.1.gz` | — |
 
