@@ -110,7 +110,7 @@ MOV s,!a  :: 0xb0|s,a
 MOV t,!a  :: 0xb8|t,a,a>>8
 ```
 
-`.map::x::R0,R1,R2,R3::1<<x` combines giving values to a list of names and the `.check` for that position into one line. `.enum` captures register *lists* (including `-` ranges) such as those of the 68000 `MOVEM` and folds their composition into a single value. `.sub` gathers the alternatives that may appear at a position into a named *table of patterns*, referred to by `!S{{name}}variable`. Whereas `.check` restricts a symbol, a subtable lets a pattern stand at that position. `.as::s::r` copies the `.check`, `.enum` and `.reloc` that the variable r has at that point to the variable s, so an instruction with several operands of the same register class needs its constraint written only once.
+`.map::x::R0,R1,R2,R3::1<<x` combines giving values to a list of names and the `.check` for that position into one line. `.enum` captures register *lists* (including `-` ranges) such as those of the 68000 `MOVEM` and folds their composition into a single value. `.sub` gathers the alternatives that may appear at a position into a named *table of patterns*, referred to by `!S{{name}}variable`. Whereas `.check` restricts a symbol, a subtable lets a pattern stand at that position. `.as::s::r` copies the `.check`, `.map`, `.enum` and `.reloc` that the variable r has at that point to the variable s, so an instruction with several operands of the same register class needs its constraint written only once.
 
 The symbol capturer `!Yset[variable]`, added in the current version, reads one item name of a set at that position and binds its *index* to the variable.
 

@@ -2710,10 +2710,10 @@ match too. On RISC-V, after `ld.lld`'s relaxation shrinks each `call` into a
 .as::<variable,variable,...>::<variable>
 ```
 
-Copies what the variable on the right has at that point — its `.check` (including
-one set by `.map`), its `.enum` and its `.reloc` — to the variables listed on the
-left. What the right variable does not have is taken off the left ones too. When
-an instruction has two or more operands that take the same set of registers, this
+Copies what the variable on the right has at that point — its `.check`, `.map`,
+`.enum` and `.reloc` declarations — to the variables listed on the left. What
+the right variable does not have is taken off the left ones too. When an
+instruction has two or more operands that take the same set of registers, this
 saves writing the same `.check` once per variable.
 
 ```
