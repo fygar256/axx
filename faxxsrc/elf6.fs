@@ -9,6 +9,12 @@ bind rcon-take snap-extra-take
 bind rcon-restore snap-extra-restore
 : lineclear-extra-nn10 rcon om-clear ; bind lineclear-extra-nn10 lineclear-extra
 : dir-pat-clear-extra-nn11 ( a u -- ) rcon om-del ; bind dir-pat-clear-extra-nn11 dir-pat-clear-extra
+: dir-as-extra-nn12 ( sa su da du -- ) { sa su da du }
+  sa su rcon om-find ?dup if
+    dup @ over cell+ @ rot 2 cells + @ { rt fm pp }
+    da du rcon om-put { sl }  rt sl !  fm sl cell+ !  pp sl 2 cells + !
+  else da du rcon om-del then ;
+bind dir-as-extra-nn12 dir-as-extra
 
 : reloc-name-err ( ta tu -- ) { ta tu }                  \ 同じ (名前, 機種) では 1 回だけ
   ta tu slower s\" \x01" sconcat elf-machine @ n>s sconcat { ka ku }

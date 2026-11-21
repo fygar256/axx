@@ -133,7 +133,7 @@ make faxx                                                # or build ./faxx with 
 
 ### Testing
 
-`test1` assembles every pattern file / source pair with caxx and paxx, 220 runs on each side, and compares the results with `cmp`. Besides the `-b` images it compares ELF objects (`-o`, ELF64 and ELF32), DWARF (`-g`), listings (`-v`), translated text (`-V`) and the diagnostics on standard error, including the `_err.s` files of lines a pattern file must refuse and the `_edge.s` files of lines at the edges of the ranges.
+`test1` assembles every pattern file / source pair with caxx and paxx, 225 runs on each side, and compares the results with `cmp`. Besides the `-b` images it compares ELF objects (`-o`, ELF64 and ELF32), DWARF (`-g`), listings (`-v`), translated text (`-V`) and the diagnostics on standard error, including the `_err.s` files of lines a pattern file must refuse and the `_edge.s` files of lines at the edges of the ranges.
 
 The two implementations are also checked against each other by differential fuzzing; the disagreements found that way are kept in `regress.axx` and `regress*.s`.
 

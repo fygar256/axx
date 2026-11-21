@@ -68,16 +68,16 @@ above.
 
 All three are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that for Paxx and Caxx: `test1` assembles all one hundred and fourteen
+exactly that for Paxx and Caxx: `test1` assembles all one hundred and eighteen
 bundled pattern/source pairs with both and `cmp`s the results, two hundred and
-twenty runs on each side. Besides the `-b` images it compares the translated
+twenty-five runs on each side. Besides the `-b` images it compares the translated
 text of `-V` (the `.textmode` pairs, `exprmiss.axx`, `regress.axx`), the `.echo`
 lines written to standard error (`echo.axx`, `ministr.axx`), the diagnostics of
 the `_err.s` files and of the regression tests, the ELF objects of the
 relocation tests and the `--elfdesc` output. The sixteen core pairs are run
 under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V` as well, so the ELF32 and
 ELF64 objects, the DWARF, the listing and the text output are compared too, for
-two hundred and fifty-six comparisons in all. Appendix B lists them.
+two hundred and sixty-one comparisons in all. Appendix B lists them.
 
 Faxx is not run by `test1`. Where this manual says "both implementations" it
 means Paxx and Caxx, the pair `test1` checks; Faxx follows the same rules,
@@ -670,7 +670,7 @@ LD A,!n :: 0x3e,n
 **Variable names.** A variable is written `x` above, but a name may be longer:
 it starts with a lowercase letter and continues over lowercase letters, digits
 and `_`, so `abcdef`, `var1` and `var_2` are all variable names. The same names
-are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map` and `.free`.
+are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map`, `.free` and `.as`.
 
 ```
 .check::reg::BC,DE,HL,SP
@@ -2704,6 +2704,71 @@ The bundled `elfcfi.axx` / `elfcfi.s` (x86-64) and `elfpair.axx` / `elfpair.s`
 match too. On RISC-V, after `ld.lld`'s relaxation shrinks each `call` into a
 `jal`, the rows sit where they do in llvm-mc's object linked the same way.
 
+#### 3.7.12 `.as` — copy a variable's declarations to other variables
+
+```
+.as::<variable,variable,...>::<variable>
+```
+
+Copies what the variable on the right has at that point — its `.check` (including
+one set by `.map`), its `.enum` and its `.reloc` — to the variables listed on the
+left. What the right variable does not have is taken off the left ones too. When
+an instruction has two or more operands that take the same set of registers, this
+saves writing the same `.check` once per variable.
+
+```
+.check::r::B,C,D,E,H,L,A
+.as::s::r
+LD r,s :: 0x40|r<<3|s
+```
+
+```
+ld b,c          -> 41
+ld a,l          -> 7d
+```
+
+- **The copy is made where the line stands.** Like `.check`, `.as` is positional:
+  it copies what the right variable has at the `.as` line. Declaring the right
+  variable again later does not change the left ones. Declaring a left variable
+  again later with `.check` and so on takes effect as usual.
+
+  ```
+  .check::r::B,C,D,E,H,L,A
+  .as::s::r
+  .check::r::BC,DE,HL,SP          /* s keeps B..A */
+  ```
+
+- Only the per-variable declarations are copied. The captured values stay
+  separate: in `LD r,s`, `r` and `s` each hold their own value. Symbols (names
+  defined by `.setsym` or `.map`) do not belong to a variable, so there is nothing
+  to copy there.
+- The left side can list several variables separated by commas
+  (`.as::p,q::r`). Writing the right variable itself on the left does nothing.
+- Copying a variable that has nothing declared takes every declaration off the
+  left variables (`.clrcheck`, `.clrenum` and `.clrreloc` together).
+- As with the other directives, a variable name written in upper case is read in
+  lower case. Something that is not a variable name, or an empty side, is an
+  error.
+- `.reloc` is copied only under `-o` (`.reloc` itself only takes effect under
+  `-o`).
+
+**In an `.unordered` file** (3.19) every declaration holds for the whole file, so
+`.as` copies what the right variable has in the whole file. The `.as` lines are
+processed after all the other directives, and when the right variable is on the
+left of another `.as`, that `.as` is processed first. So `.as::q::p` written above
+`.as::p::r` and `.check::r::…` still makes `q` the same as `r`. The per-variable
+table built by `.map` is copied too. These are errors:
+
+- writing the same variable on the left of two `.as` lines with different right
+  variables (repeating the same right variable is fine);
+- writing a `.check` / `.map`, an `.enum` or a `.reloc` for a variable that is on
+  the left of an `.as`;
+- `.as` lines that copy each other (a cycle).
+
+The bundled `as.axx` / `as.s` (`-b` and `-m 62 -o`), `as_unord.axx` /
+`as_unord.s`, and `as_err.axx` and `as_uerr.axx` for the errors (both with the
+source `as_err.s`) are the tests of this section.
+
 ### 3.8 Optional parts (`[[ ]]`)
 
 Double brackets mark an optional section of an instruction:
@@ -3998,7 +4063,7 @@ themselves. The declaration itself may go anywhere (an included file counts too)
   line, in this order: (1) the settings (`.symbolc`, `.bits`, `.padding`,
   `.vliw`, `EPIC`, `.passthru`, `.eol`, `.textmode`), (2) `.setsym`, (3) the rest
   (`.check`, `.map`, `.enum`, `.reloc`, `.error`, `.echo`, the ELF description and
-  so on).
+  so on), (4) `.as` (3.7.12).
 - When a `.setsym` value reads the name of another `.setsym`, the one it reads is
   processed first, so `.setsym::HI::#BASE+1` works when written above
   `.setsym::BASE::0x40`. Names are picked up as runs of letters, digits and `_`.
@@ -4006,7 +4071,8 @@ themselves. The declaration itself may go anywhere (an included file counts too)
 - Each thing has one definition. Writing a `.setsym` of the same name, a `.check` /
   `.map` of the same variable, an `.enum` of the same variable, a `.reloc` of the
   same variable, an `.error` of the same code, or the same setting twice **with
-  different contents** is an error. Repeating it word for word is fine.
+  different contents** is an error. Repeating it word for word is fine. A
+  variable on the left of an `.as` counts as defined by that `.as` (3.7.12).
 - `.clearsym`, `.clrcheck`, `.clrenum`, `.clrreloc` and `.free`, which only mean
   "from here on", cannot be used (error).
 - The ELF description (`.elf*`) can be written as many times as before.
@@ -5457,6 +5523,10 @@ The x86_64 pattern file is also maintained separately at
 | **datadir.axx** | 1.0 KB | 3 | **datadir.s**, **datadir_err.s** | `.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` (5.3); 8-bit, little, with `.eol`; test only |
 | **datadirbe.axx** | 613 B | 3 | **datadir.s** | the same source with 8-bit words, big-endian; test only |
 | **datadirw.axx** | 764 B | 3 | **datadir.s** | the same source with 16-bit words; test only |
+| **as.axx** | 1.8 KB | 46 | **as.s** | `.as` copies `.check` / `.enum` / `.reloc` where the line stands (3.7.12); test only |
+| **as_unord.axx** | 991 B | 14 | **as_unord.s** | `.as` in an `.unordered` file: copying in dependency order and the per-variable `.map` table (3.7.12); test only |
+| **as_err.axx** | 561 B | 7 | **as_err.s** | the errors of `.as` (3.7.12); test only |
+| **as_uerr.axx** | 757 B | 13 | **as_err.s** | duplicate definitions and cycles of `.as` in an `.unordered` file (3.7.12); test only |
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
@@ -5556,7 +5626,7 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all one hundred and fourteen pairs through Paxx and Caxx and
+`test1` runs all one hundred and eighteen pairs through Paxx and Caxx and
 compares the `-b` raw binaries. For the six pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx`, `expcap.axx` and `callstr.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5658,13 +5728,17 @@ compares the diagnostics of text left after the argument of a directive. `datadi
 compares the data directives such as `.db` (section 5.3): the `-v` listing built
 with three pattern files of different byte order and word width (`datadir.axx`,
 `datadirbe.axx`, `datadirw.axx`) and the `-o` ELF built with `datadir.axx`;
-`datadir_err.s` (`datadir.axx`) compares their diagnostics.
+`datadir_err.s` (`datadir.axx`) compares their diagnostics. `as.s` compares the
+declarations copied by `.as` (3.7.12) in the `-b` image and in the `-m 62 -o` ELF,
+`as_unord.s` compares `.as` in an `.unordered` file in the `-b` image, and
+`as_err.s` compares the diagnostics of the `.as` errors built with `as_err.axx`
+and `as_uerr.axx`.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and fifty-six comparisons in all.
+never compares, for two hundred and sixty-one comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5702,8 +5776,8 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all one hundred and fourteen bundled pattern/source pairs with
-Paxx and Caxx and compares the results, two hundred and fifty-six comparisons
+`test1` assembles all one hundred and eighteen bundled pattern/source pairs with
+Paxx and Caxx and compares the results, two hundred and sixty-one comparisons
 in all (Appendix B lists what each pair compares).
 
 ### C.2 External

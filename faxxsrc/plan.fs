@@ -13,7 +13,7 @@ decimal
     9 of s" .reloc" endof    10 of s" .clrreloc" endof 11 of s" .map" endof     12 of s" .free" endof
     13 of s" .passthru" endof 14 of s" .eol" endof     15 of s" .textmode" endof 16 of s" .enum" endof
     17 of s" .clrenum" endof 18 of s" .error" endof    19 of s" .echo" endof    20 of s" .unordered" endof
-    21 of s" EPIC" endof
+    21 of s" EPIC" endof     22 of s" .as" endof
     drop s" " 0
   endcase ;
 
@@ -82,7 +82,8 @@ MAXROWS cells lazy u-symv
 MAXROWS cells lazy u-restv
 MAXROWS cells lazy u-ordv
 MAXROWS lazy u-donev
-variable nu-first  variable nu-syms  variable nu-rest  variable nu-ord
+MAXROWS cells lazy u-asv
+variable nu-first  variable nu-syms  variable nu-rest  variable nu-ord  variable nu-as
 variable u-cur
 2 lazy-om u-definer
 variable u-depmiss
@@ -96,13 +97,95 @@ variable u-depmiss
   r 1 rf nip if r 2 rf ['] u-dep-hit each-ref then
   u-depmiss @ 0= ;
 
+\ ---- .unordered の .as ----
+\ 写し先ごとに鍵 "as <変数>"、中身は写し元の名前で重複を調べ、.as の組に積む
+: u-as-row ( r -- ) { r }
+  r as-dests { l }
+  r 2 rf trim slower { sa su }
+  l lst-n 0 ?do
+    l i lst-item item-str slower { da du }
+    s" as " da du sconcat { ka ku }
+    ka ku useen om-find ?dup if
+      { sl1 }
+      sl1 1 cells + s@ sa su str=cs 0= if
+        mb-reset s"  error - .unordered: pattern lines " mb+ sl1 @ 1+ mb-n s"  and " mb+ r 1+ mb-n
+        s"  give variable '" mb+ da du mb+ s" ' (.as) two different definitions." mb+ mb-get diag-e
+      then
+    else
+      ka ku useen om-put { sl2 }  r sl2 !  sa su hdup sl2 1 cells + s!
+    then
+  loop
+  r nu-as @ cells u-asv + !  1 nu-as +! ;
+\ 写し先 d に、組 g (.check/.map・.enum・.reloc) の定義もあれば重複定義
+: u-as-cross1 ( da du r ga gu na nu -- ) { da du r ga gu na nu }
+  ga gu s"  " sconcat da du sconcat useen om-find ?dup if
+    @ r 2dup > if swap then { lo hi }
+    mb-reset s"  error - .unordered: pattern lines " mb+ lo 1+ mb-n s"  and " mb+ hi 1+ mb-n
+    s"  give variable '" mb+ da du mb+ s" ' (.as and " mb+ na nu mb+ s" ) two different definitions." mb+
+    mb-get diag-e
+  then ;
+: u-as-cross ( -- )
+  nu-as @ 0 ?do
+    i cells u-asv + @ { r }
+    r as-dests { l }
+    l lst-n 0 ?do
+      l i lst-item item-str slower { da du }
+      da du r s" check" s" .check/.map" u-as-cross1
+      da du r s" enum" s" .enum" u-as-cross1
+      da du r s" reloc" s" .reloc" u-as-cross1
+    loop
+  loop ;
+\ 行 q の .as の写し先に名前 a u があるか
+: as-dest-has? ( q a u -- f ) { q a u }
+  false { f }
+  q as-dests { l }
+  l lst-n 0 ?do l i lst-item item-str slower a u str=cs if true to f then loop
+  f ;
+\ 行 r の写し元を写し先に持つ、まだ済んでいない他の .as が (先頭 n 個の中に) 無いか
+: as-dep-done? ( r n -- f ) { r n }
+  r 2 rf trim slower { sa su }
+  true { ok }
+  n 0 ?do
+    i cells u-asv + @ { q }
+    q r <> if q u-donev + c@ 0= if q sa su as-dest-has? if false to ok then then then
+  loop
+  ok ;
+\ .as を、写し元が先に決まる順で dirorder の後ろへ足す
+: u-as-order ( -- )
+  nu-as @ { apend }
+  begin apend 0> while
+    -1 { nxt }
+    apend 0 ?do i cells u-asv + @ apend as-dep-done? if i to nxt leave then loop
+    nxt 0< if
+      uk-b sb-clear
+      true { fst }
+      apend 0 ?do
+        i cells u-asv + @ as-dests { l }
+        l lst-n 0 ?do
+          fst 0= if s" , " uk-b sb+ then  false to fst
+          s" '" uk-b sb+ l i lst-item item-str slower uk-b sb+ s" '" uk-b sb+
+        loop
+      loop
+      mb-reset s"  error - .unordered: the .as definitions of " mb+ uk-b sb$ mb+
+      s"  refer to each other in a cycle." mb+ mb-get diag-e
+      apend 0 ?do i cells u-asv + @ dirorder dirorder-n @ cells + ! 1 dirorder-n +! loop
+      0 to apend
+    else
+      nxt cells u-asv + @ { r }
+      r dirorder dirorder-n @ cells + !  1 dirorder-n +!
+      1 u-donev r + c!
+      apend 1- nxt ?do i 1+ cells u-asv + @ i cells u-asv + ! loop
+      apend 1- to apend
+    then
+  repeat ;
+
 : unordered-plan ( -- )
   false unordered-on !  0 dirorder-n !
   false { any }
   nrows @ 0 ?do i risdir @ if i rkind @ 20 = if true to any then then loop
   any 0= if exit then
   true unordered-on !
-  0 nu-first !  0 nu-syms !  0 nu-rest !
+  0 nu-first !  0 nu-syms !  0 nu-rest !  0 nu-as !
   useen om-clear  u-definer om-clear
   nrows @ 0 ?do
     i risdir @ if
@@ -112,6 +195,7 @@ variable u-depmiss
           mb-reset k kind-name mb+ s" : cannot be used in an .unordered pattern file (pattern line " mb+ i 1+ mb-n
           s" ); there every definition holds for the whole file." mb+ mb-get diag-e
         then
+        k 22 = if i u-as-row else
         i unordered-key if
           { ka ku la lu }
           i row-text sdup { ta tu }
@@ -139,7 +223,7 @@ variable u-depmiss
           else
             i nu-rest @ cells u-restv + !  1 nu-rest +!
           then then
-        then
+        then then
       then
     then
   loop
@@ -174,11 +258,13 @@ variable u-depmiss
       npend 1- to npend
     then
   repeat
-  \ first + 並べ替えた .setsym + その他
+  u-as-cross
+  \ first + 並べ替えた .setsym + その他 + 並べ替えた .as
   0 dirorder-n !
   nu-first @ 0 ?do i cells u-firstv + @ dirorder dirorder-n @ cells + ! 1 dirorder-n +! loop
   nu-ord @ 0 ?do i cells u-ordv + @ dirorder dirorder-n @ cells + ! 1 dirorder-n +! loop
-  nu-rest @ 0 ?do i cells u-restv + @ dirorder dirorder-n @ cells + ! 1 dirorder-n +! loop ;
+  nu-rest @ 0 ?do i cells u-restv + @ dirorder dirorder-n @ cells + ! 1 dirorder-n +! loop
+  u-as-order ;
 
 \ ---- パターンファイルのシンボルの先読み ----
 : pat-sym-row ( r -- ) dup rkind @ { k }

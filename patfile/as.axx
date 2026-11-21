@@ -1,0 +1,77 @@
+/* ===================================================================
+/* as.axx -- `.as`: copy a variable's .check / .enum / .reloc to other
+/*           variables at that point of the pattern file (manual 3.7.12)
+/*
+/*   .as::<variable,variable,...>::<variable>
+/*
+/* The variables on the left get what the variable on the right has
+/* at that point: its .check list, its .enum and its .reloc. What the
+/* right one does not have is taken off the left ones. The copy is
+/* made once, where the line stands: changing the right variable
+/* later does not change the left ones.
+/*
+/*   axx as.axx as.s -b out.bin
+/*   axx as.axx as.s -o out.o -m 62      (the .reloc part)
+/* =================================================================== */
+
+.bits::8
+
+.setsym::B::0
+.setsym::C::1
+.setsym::D::2
+.setsym::E::3
+.setsym::H::4
+.setsym::L::5
+.setsym::A::7
+.setsym::BC::0
+.setsym::DE::1
+.setsym::HL::2
+.setsym::SP::3
+
+/* s gets r's list, so LD takes two 8-bit registers */
+.check::r::B,C,D,E,H,L,A
+.as::s::r
+LD r,s :: 0x40|r<<3|s
+
+/* several variables at once */
+.as::p,q::r
+ADD p,q :: 0x80|p<<3|q
+
+/* r changes; s, p and q keep the 8-bit list */
+.check::r::BC,DE,HL,SP
+INC r :: 0x03|r<<4
+SUB s :: 0x90|s
+
+/* r is made the same as x again */
+.check::x::BC,DE,HL
+.as::r::x
+DEC r :: 0x0b|r<<4
+
+/* y has nothing declared, so copying it takes s's list off */
+.as::s::y
+JP s :: 0xc3,s,s>>8
+
+/* .enum is copied too */
+.setsym::R0::1
+.setsym::R1::2
+.setsym::R2::4
+.setsym::R3::8
+.enum::m::R0,R1,R2,R3::R0|R1|R2|R3
+.as::n::m
+PUSHM !Em :: 0xe0,m
+POPM !En :: 0xe1,n
+
+/* .reloc is copied too (written only with -o) */
+.elftype::pc32::2
+.elftype::abs32::10
+.reloc::t::pc32
+.as::u::t
+.clrreloc::t
+CALL !u :: 0xe8,u,u>>8,u>>16,u>>24
+.reloc::w::abs32
+.as::v::w
+.clrreloc::w
+DD !v :: v,v>>8,v>>16,v>>24
+DW !t :: t,t>>8,t>>16,t>>24
+
+RET :: 0xc3

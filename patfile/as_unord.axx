@@ -1,0 +1,33 @@
+/* ===================================================================
+/* as_unord.axx -- `.as` in an .unordered pattern file (manual 3.7.12)
+/*
+/* In an .unordered file every definition holds for the whole file, so
+/* `.as` copies what the right variable has in the whole file: the .as
+/* lines are done after all the other directives, and an .as whose
+/* right variable is the left one of another .as comes after that one.
+/* Here q gets p's list, p gets r's list, and r is defined last.
+/*
+/*   axx as_unord.axx as_unord.s -b out.bin
+/* =================================================================== */
+
+.unordered
+
+.as::q::p
+.as::p::r
+
+LD p,q :: 0x40|p<<3|q
+
+/* the per-variable table of an .unordered .map is copied too: k reads
+/* C as the carry condition (3), while p and q read C as register 1 */
+.as::k::c
+JP k,!n :: 0xc2|k<<3,n,n>>8
+.map::c::NZ,Z,NC,C
+
+.check::r::B,C,D,E,H,L,A
+.setsym::B::0
+.setsym::C::1
+.setsym::D::2
+.setsym::E::3
+.setsym::H::4
+.setsym::L::5
+.setsym::A::7

@@ -1,0 +1,14 @@
+/* ===================================================================
+/* as_err.axx -- the errors of `.as` (manual 3.7.12)
+/*
+/*   axx as_err.axx as_err.s -b out.bin
+/* =================================================================== */
+
+.as::s                  /* the right variable is missing */
+.as:: , ::r             /* only empty items on the left */
+.as::s::1x              /* not a variable name */
+.as::s,2y::r            /* every name is checked */
+.as::s::r x
+.as::S::R               /* upper case is read as lower case: no error */
+
+NOP :: 0x00

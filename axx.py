@@ -240,7 +240,7 @@ def _lead_caps(pat_text):
 
 
 # 位置によらず効き方が変わらないディレクティブ（_pat_hoist_scan() が先に処理する）。
-_HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
+_HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc', '.as',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
                     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection',
@@ -345,6 +345,13 @@ _UNORDERED_FIRST = ('.unordered', '.symbolc', '.bits', '.padding', '.vliw',
                     '.passthru', '.eol', '.textmode')
 
 
+def _as_names(i):
+    """`.as::<変数,...>::<変数>` の欄を (写し先の綴りの並び, 写し元の綴り) に分ける（空の項目は除く）。"""
+    dst = i[1] if len(i) > 1 else ''
+    src = i[2] if len(i) > 2 else ''
+    return [t.strip() for t in dst.split(',') if t.strip()], src.strip()
+
+
 def _unordered_key(i):
     """`.unordered` での重複検査の鍵と、エラーで名指す言い方（鍵が無ければ None）。"""
     name = i[0]
@@ -391,13 +398,14 @@ def _unordered_refs(text):
 def _pat_unordered_plan(pat, isdir):
     """`.unordered` のとき、ディレクティブ行を処理する順を返す（宣言が無ければ None）。
 
-    順は 設定もの（_UNORDERED_FIRST と EPIC）→ `.setsym`（依存順）→ その他。
-    中身の違う重複定義と _UNORDERED_BANNED はエラー。caxx.c の pat_unordered_plan() と同じ。
+    順は 設定もの（_UNORDERED_FIRST と EPIC）→ `.setsym`（依存順）→ その他 → `.as`（依存順）。
+    中身の違う重複定義と _UNORDERED_BANNED はエラー。`.as` の写し先に `.check` / `.map` /
+    `.enum` / `.reloc` も書くのも重複定義とする。caxx.c の pat_unordered_plan() と同じ。
     """
     if not any(isdir[r] and pat[r] and pat[r][0] == '.unordered'
                for r in range(len(pat))):
         return None
-    first, syms, rest = [], [], []
+    first, syms, rest, alias = [], [], [], []
     seen = {}
     for r, i in enumerate(pat):
         if not isdir[r] or not i:
@@ -407,6 +415,17 @@ def _pat_unordered_plan(pat, isdir):
             diag(f" error - {name}: cannot be used in an .unordered pattern file "
                  f"(pattern line {r + 1}); there every definition holds for the "
                  f"whole file.", set_error=True)
+        if name == '.as':
+            dsts, src = _as_names(i)
+            src = src.translate(_ALOWER)
+            for d in dsts:
+                d = d.translate(_ALOWER)
+                prev = seen.setdefault('as ' + d, (r, src))
+                if prev[1] != src:
+                    diag(f" error - .unordered: pattern lines {prev[0] + 1} and {r + 1} "
+                         f"give variable '{d}' (.as) two different definitions.", set_error=True)
+            alias.append(r)
+            continue
         key, label = _unordered_key(i)
         if key is not None:
             text = '::'.join(f.strip() for f in i)
@@ -444,7 +463,35 @@ def _pat_unordered_plan(pat, isdir):
         order.append(nxt)
         done.add(nxt)
         pending.remove(nxt)
-    return first + order + rest
+
+    # `.as` は他の定義をすべて入れた後に、写し元が先に決まる順で写す。
+    adst = {r: [d.translate(_ALOWER) for d in _as_names(pat[r])[0]] for r in alias}
+    asrc = {r: _as_names(pat[r])[1].translate(_ALOWER) for r in alias}
+    for r in alias:
+        for d in adst[r]:
+            for grp, dn in (('check', '.check/.map'), ('enum', '.enum'), ('reloc', '.reloc')):
+                prev = seen.get(grp + ' ' + d)
+                if prev is not None:
+                    lo, hi = sorted((prev[0], r))
+                    diag(f" error - .unordered: pattern lines {lo + 1} and {hi + 1} give "
+                         f"variable '{d}' (.as and {dn}) two different definitions.",
+                         set_error=True)
+    adeps = {r: {q for q in alias if q != r and asrc[r] in adst[q]} for r in alias}
+    adone = set()
+    aorder = []
+    pending = list(alias)
+    while pending:
+        nxt = next((r for r in pending if adeps[r] <= adone), None)
+        if nxt is None:
+            names = ', '.join("'" + d + "'" for r in pending for d in adst[r])
+            diag(f" error - .unordered: the .as definitions of {names} refer to "
+                 f"each other in a cycle.", set_error=True)
+            aorder.extend(pending)
+            break
+        aorder.append(nxt)
+        adone.add(nxt)
+        pending.remove(nxt)
+    return first + order + rest + aorder
 
 
 def _build_pat_index(pat, isdir):
@@ -4919,6 +4966,35 @@ class DirectiveProcessor:
             st.enum_defs[var] = (tuple(names), expr_field)
         return True
 
+    def as_processing(self, i):
+        """`.as::<変数,...>::<変数>` — 写し元の変数の `.check` / `.enum` / `.reloc`（と
+        `.unordered` の `.map` の表）を、その位置で写し先の変数へ写す。写し元に無いものは
+        写し先からも外す。後で写し元を変えても写し先は変わらない。caxx.c の dir_as() と同じ。
+        """
+        st = self.state
+        dsts, src = _as_names(i)
+        if not dsts or not src:
+            st.diag(" error - .as: needs '.as::<variable,...>::<variable>'.", set_error=True)
+            return True
+        vs = []
+        for f in dsts + [src]:
+            v = self._dir_var(f)
+            if v is None:
+                st.diag(f" error - .as: variable should be a lower case name ('{f}').", set_error=True)
+                return True
+            vs.append(v)
+        sv = vs.pop()
+        for dv in vs:
+            if dv == sv:
+                continue
+            for d in (st.check_constraints, st.reloc_constraints, st.reloc_masks,
+                      st.reloc_pairs, st.enum_defs, st.var_tables):
+                if sv in d:
+                    d[dv] = d[sv]
+                else:
+                    d.pop(dv, None)
+        return True
+
     def clrenum_processing(self, i):
         """`.clrenum` — `.enum` の宣言を外す（引数なしで全部）。"""
         return self._clear_var_dir(i, '.clrenum', (self.state.enum_defs,), False)
@@ -4966,6 +5042,7 @@ _PAT_DIRECTIVE_HANDLERS = {
     '.textmode': 'textmode_processing', '.enum': 'enum_processing',
     '.clrenum': 'clrenum_processing', '.error': 'errmsg_processing',
     '.echo': 'echo_processing', '.unordered': 'unordered_processing',
+    '.as': 'as_processing',
 }
 # ELF 記述の宣言（ソースを読む前に register_elfdecls() が先に通す）。
 _ELF_DECLS = ('.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth', '.elfextern',

@@ -1233,7 +1233,7 @@ enum {
     PD_ELFPCGUESS, PD_ELFBUILTIN, PD_ELFEXTRA, PD_ELFDIFF, PD_ELFENCODE,
     PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP, PD_ELFCFI, PD_ELFCFIINIT,
     PD_ELFCFIREG, PD_UNORDERED, PD_ELFRELAX, PD_ELFANCHOR, PD_ELFRESOLVE,
-    PD_ELFUNALIGNED
+    PD_ELFUNALIGNED, PD_AS
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1263,7 +1263,8 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfgroup", PD_ELFGROUP },
         { ".elfcfi", PD_ELFCFI }, { ".elfcfiinit", PD_ELFCFIINIT },
         { ".elfcfireg", PD_ELFCFIREG },
-        { ".echo", PD_ECHO }, { ".unordered", PD_UNORDERED }, { NULL, 0 } };
+        { ".echo", PD_ECHO }, { ".unordered", PD_UNORDERED }, { ".as", PD_AS },
+        { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
     for(int k=0; tbl[k].name; k++) if(strcmp(n, tbl[k].name) == 0) return tbl[k].kind;
@@ -1290,7 +1291,7 @@ static int pat_is_directive(const PatEntry *e){
         ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
         ".elfpcguess", ".elfbuiltin", ".elfextra", ".elfdiff", ".elfencode",
         ".elfrelax", ".elfanchor", ".elfresolve", ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
-        ".elfcfireg", ".elfunaligned", ".unordered", NULL };
+        ".elfcfireg", ".elfunaligned", ".unordered", ".as", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1736,7 +1737,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
         if(const_setsym_text(val)) return 1;
         return pat_is_name_list(val);
     }
-    case PD_CHECK: case PD_CLRCHECK: case PD_RELOC: case PD_CLRRELOC:
+    case PD_CHECK: case PD_CLRCHECK: case PD_RELOC: case PD_CLRRELOC: case PD_AS:
     case PD_SYMBOLC: case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
@@ -1855,7 +1856,9 @@ static void pat_hoist_scan(PatVec *v){
         .textmode と EPIC）
      2. .setsym — 値が別の .setsym の名前を読むなら、その定義を先に
      3. その他（.check .map .enum .reloc .error ELF の表など）
-   で、各組の中は書かれた順。同じ名前・同じ変数への中身の違う定義と、
+     4. .as — 写し元が別の .as の写し先なら、その .as を先に
+   で、各組の中は書かれた順。同じ名前・同じ変数への中身の違う定義
+   （.as の写し先に .check .map .enum .reloc も書くのを含む）と、
    位置の意味しか持たないディレクティブ（.clearsym .clrcheck .clrenum
    .clrreloc .free）はエラーにする。axx.py の _pat_unordered_plan() と
    同じ規則である。
@@ -1874,6 +1877,30 @@ static char *unord_trim_dup(const char *s){
 /* ASCII の小文字を大文字にする（その場で）。 */
 static void unord_upper(char *s){
     for(; *s; s++) if(*s >= 'a' && *s <= 'z') *s = (char)(*s - 32);
+}
+
+/* `.as::<変数,...>::<変数>` の写し先の欄を、前後の空白を除いた綴りの並びに
+   分ける（空の項目は除く）。axx.py の _as_names() と同じ。 */
+static void as_dest_names(const PatEntry *e, StrVec *out){
+    const char *p = e->f[1];
+    for(;;){
+        const char *q = p;
+        while(*q && *q != ',') q++;
+        size_t n = (size_t)(q - p);
+        char *t = malloc(n + 1);
+        if(!t){ perror("malloc"); exit(1); }
+        memcpy(t, p, n); t[n] = '\0';
+        char *u = unord_trim_dup(t);
+        if(u[0]) sv_push(out, u);
+        free(u); free(t);
+        if(!*q) break;
+        p = q + 1;
+    }
+}
+
+/* ASCII の大文字を小文字にする（その場で）。 */
+static void unord_lower(char *s){
+    for(; *s; s++) *s = (char)tolower((unsigned char)*s);
 }
 
 /* `.setsym` が定義する名前（大文字、free する）。 */
@@ -1986,7 +2013,7 @@ static void pat_unordered_plan(PatVec *v){
         if(v->data[pi].is_dir && v->data[pi].dir_kind == PD_UNORDERED){ g_unordered = 1; break; }
     if(!g_unordered) return;
 
-    PatRowList first = {0}, syms = {0}, rest = {0};
+    PatRowList first = {0}, syms = {0}, rest = {0}, alias = {0};
     StrVec keys; sv_init(&keys);
     StrVec texts; sv_init(&texts);
     PatRowList keyrows = {0};
@@ -1999,6 +2026,34 @@ static void pat_unordered_plan(PatVec *v){
             axx_diagf(1, 0, " error - %s: cannot be used in an .unordered pattern file "
                             "(pattern line %d); there every definition holds for the "
                             "whole file.\n", e->f[0], pi + 1);
+        if(k == PD_AS){
+            StrVec dsts; sv_init(&dsts);
+            as_dest_names(e, &dsts);
+            char *src = unord_trim_dup(e->f[2]);
+            unord_lower(src);
+            for(int di = 0; di < dsts.len; di++){
+                char *d = dsts.data[di];
+                unord_lower(d);
+                char key[600];
+                snprintf(key, sizeof(key), "as %s", d);
+                int found = -1;
+                for(int j = 0; j < keys.len; j++)
+                    if(strcmp(keys.data[j], key) == 0){ found = j; break; }
+                if(found < 0){
+                    sv_push(&keys, key);
+                    sv_push(&texts, src);
+                    prl_push(&keyrows, pi);
+                } else if(strcmp(texts.data[found], src) != 0){
+                    axx_diagf(1, 0, " error - .unordered: pattern lines %d and %d "
+                                    "give variable '%s' (.as) two different definitions.\n",
+                              keyrows.rows[found] + 1, pi + 1, d);
+                }
+            }
+            free(src);
+            sv_free(&dsts);
+            prl_push(&alias, pi);
+            continue;
+        }
         char key[600], label[600];
         if(unord_key(e, key, sizeof(key), label, sizeof(label))){
             char *text = unord_text(e);
@@ -2025,9 +2080,6 @@ static void pat_unordered_plan(PatVec *v){
         else
             prl_push(&rest, pi);
     }
-    for(int j = 0; j < keys.len; j++){ free(keys.data[j]); free(texts.data[j]); }
-    free(keys.data); free(texts.data); free(keyrows.rows);
-
     /* .setsym の依存。deps[a*n+b] が真なら a は b の定義を先に要る。
        同じ名前の定義が複数あるときは最初のものを定義元とする。 */
     int n = syms.n;
@@ -2082,7 +2134,85 @@ static void pat_unordered_plan(PatVec *v){
     for(int r = 0; r < rest.n; r++) prl_push(&g_dirorder, rest.rows[r]);
     for(int a = 0; a < n; a++) free(names[a]);
     free(names); free(deps); free(done);
-    free(first.rows); free(syms.rows); free(rest.rows);
+
+    /* .as は他の定義をすべて入れた後に、写し元が先に決まる順で写す。
+       写し先に .check .map .enum .reloc も書いていれば重複定義。 */
+    int na = alias.n;
+    StrVec *adst = calloc((size_t)(na ? na : 1), sizeof(StrVec));
+    char **asrc = calloc((size_t)(na ? na : 1), sizeof(char*));
+    unsigned char *adone = calloc((size_t)(na ? na : 1), 1);
+    if(!adst || !asrc || !adone){ perror("calloc"); exit(1); }
+    for(int a = 0; a < na; a++){
+        PatEntry *e = &v->data[alias.rows[a]];
+        sv_init(&adst[a]);
+        as_dest_names(e, &adst[a]);
+        for(int di = 0; di < adst[a].len; di++) unord_lower(adst[a].data[di]);
+        asrc[a] = unord_trim_dup(e->f[2]);
+        unord_lower(asrc[a]);
+    }
+    static const char *const agrp[3][2] = {
+        { "check", ".check/.map" }, { "enum", ".enum" }, { "reloc", ".reloc" } };
+    for(int a = 0; a < na; a++)
+        for(int di = 0; di < adst[a].len; di++)
+            for(int g = 0; g < 3; g++){
+                char key[600];
+                snprintf(key, sizeof(key), "%s %s", agrp[g][0], adst[a].data[di]);
+                for(int j = 0; j < keys.len; j++){
+                    if(strcmp(keys.data[j], key) != 0) continue;
+                    int lo = keyrows.rows[j], hi = alias.rows[a];
+                    if(lo > hi){ int t = lo; lo = hi; hi = t; }
+                    axx_diagf(1, 0, " error - .unordered: pattern lines %d and %d give "
+                                    "variable '%s' (.as and %s) two different definitions.\n",
+                              lo + 1, hi + 1, adst[a].data[di], agrp[g][1]);
+                    break;
+                }
+            }
+    int aleft = na;
+    while(aleft > 0){
+        int nxt = -1;
+        for(int a = 0; a < na && nxt < 0; a++){
+            if(adone[a]) continue;
+            int ok = 1;
+            for(int b = 0; b < na && ok; b++){
+                if(b == a || adone[b]) continue;
+                for(int di = 0; di < adst[b].len; di++)
+                    if(strcmp(adst[b].data[di], asrc[a]) == 0){ ok = 0; break; }
+            }
+            if(ok) nxt = a;
+        }
+        if(nxt < 0){
+            size_t cap = 64;
+            for(int a = 0; a < na; a++)
+                if(!adone[a])
+                    for(int di = 0; di < adst[a].len; di++) cap += strlen(adst[a].data[di]) + 4;
+            char *lst = malloc(cap);
+            if(!lst){ perror("malloc"); exit(1); }
+            lst[0] = '\0';
+            int firstn = 1;
+            for(int a = 0; a < na; a++){
+                if(adone[a]) continue;
+                for(int di = 0; di < adst[a].len; di++){
+                    if(!firstn) strcat(lst, ", ");
+                    strcat(lst, "'"); strcat(lst, adst[a].data[di]); strcat(lst, "'");
+                    firstn = 0;
+                }
+            }
+            axx_diagf(1, 0, " error - .unordered: the .as definitions of %s refer to "
+                            "each other in a cycle.\n", lst);
+            free(lst);
+            for(int a = 0; a < na; a++)
+                if(!adone[a]){ prl_push(&g_dirorder, alias.rows[a]); adone[a] = 1; }
+            break;
+        }
+        prl_push(&g_dirorder, alias.rows[nxt]);
+        adone[nxt] = 1;
+        aleft--;
+    }
+    for(int a = 0; a < na; a++){ sv_free(&adst[a]); free(asrc[a]); }
+    free(adst); free(asrc); free(adone);
+    for(int j = 0; j < keys.len; j++){ free(keys.data[j]); free(texts.data[j]); }
+    free(keys.data); free(texts.data); free(keyrows.rows);
+    free(first.rows); free(syms.rows); free(rest.rows); free(alias.rows);
 
     g_hoist_rows = 0;
     g_hoist_bits = g_hoist_padding = g_hoist_symbolc = g_hoist_vliw = 0;
@@ -9030,6 +9160,60 @@ static int dir_enum(Assembler *asmb, PatEntry *e){
     asmb->st.enum_defs[idx].names = names;
     asmb->st.enum_defs[idx].expr  = strdup(expr_str);
     if(!asmb->st.enum_defs[idx].expr){ perror("strdup"); exit(1); }
+    return 1;
+}
+
+/* `.as::<変数,...>::<変数>` — 写し元の変数の `.check` / `.enum` / `.reloc`（と
+   `.unordered` の `.map` の表）を、その位置で写し先の変数へ写す。写し元に
+   無いものは写し先からも外す。後で写し元を変えても写し先は変わらない。
+   axx.py の as_processing() と同じ。 */
+static int dir_as(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".as") != 0) return 0;
+    AsmState *st = &asmb->st;
+    StrVec toks; sv_init(&toks);
+    as_dest_names(e, &toks);
+    char *src = unord_trim_dup(e->f[2]);
+    if(toks.len == 0 || !src[0]){
+        axx_diagf(1, 0, " error - .as: needs '.as::<variable,...>::<variable>'.\n");
+        free(src); sv_free(&toks);
+        return 1;
+    }
+    sv_push(&toks, src);
+    free(src);
+    int *slots = malloc((size_t)toks.len * sizeof(int));
+    if(!slots){ perror("malloc"); exit(1); }
+    for(int k = 0; k < toks.len; k++){
+        slots[k] = dir_var_slot(toks.data[k]);
+        if(slots[k] < 0){
+            axx_diagf(1, 0, " error - .as: variable should be a lower case name ('%s').\n",
+                       toks.data[k]);
+            free(slots); sv_free(&toks);
+            return 1;
+        }
+    }
+    int sv = slots[toks.len - 1];
+    for(int k = 0; k < toks.len - 1; k++){
+        int dv = slots[k];
+        if(dv == sv) continue;
+        chk_install(&st->check_constraints[dv], chk_ref(st->check_constraints[sv]));
+        st->reloc_constraints[dv] = st->reloc_constraints[sv];
+        st->reloc_masks[dv]       = st->reloc_masks[sv];
+        st->reloc_pairs[dv]       = st->reloc_pairs[sv];
+        enumdef_copy(&st->enum_defs[dv], &st->enum_defs[sv]);
+        if(st->var_tables[sv]){
+            if(!st->var_tables[dv]){
+                st->var_tables[dv] = malloc(sizeof(SymMap));
+                if(!st->var_tables[dv]){ perror("malloc"); exit(1); }
+                smap_init(st->var_tables[dv]);
+            }
+            smap_assign(st->var_tables[dv], st->var_tables[sv]);
+        } else if(st->var_tables[dv]){
+            smap_free(st->var_tables[dv]);
+            free(st->var_tables[dv]);
+            st->var_tables[dv] = NULL;
+        }
+    }
+    free(slots); sv_free(&toks);
     return 1;
 }
 
@@ -17001,6 +17185,7 @@ static int pat_dir_exec(Assembler *asmb, PatEntry *i){
     case PD_ELFCFIINIT:_dir_done = dir_elfcfiinit(asmb,i);   break;
     case PD_ELFCFIREG:_dir_done = dir_elfcfireg(asmb,i);     break;
     case PD_UNORDERED:_dir_done = dir_unordered(asmb,i);    break;
+    case PD_AS:       _dir_done = dir_as(asmb,i);           break;
     default: break;
     }
     return _dir_done;

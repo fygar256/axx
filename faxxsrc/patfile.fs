@@ -166,6 +166,7 @@ variable nrows
   2dup s" .error" str=cs if 2drop 18 exit then
   2dup s" .echo" str=cs if 2drop 19 exit then
   2dup s" .unordered" str=cs if 2drop 20 exit then
+  2dup s" .as" str=cs if 2drop 22 exit then
   s" .elftype .elfmachine .elfclass .elfrela .elfwidth .elfextern .elfdwarf .elfheader .elfsection .elffield .elfpcguess .elfrelax .elfanchor .elfresolve .elfbuiltin .elfextra .elfdiff .elfencode .elfrinfo .elfunit .elflink .elfgroup .elfcfi .elfcfiinit .elfcfireg .elfunaligned"
   { a u la lu }
   begin lu 0> while

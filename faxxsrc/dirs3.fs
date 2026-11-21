@@ -7,11 +7,13 @@ defer dir-clrreloc ( row -- )
 defer dir-echo ( row -- )
 defer dir-elf ( row mode -- )
 defer dir-pat-clear-extra ( a u -- )              \ .free が reloc 系も消すための口
+defer dir-as-extra ( sa su da du -- )             \ .as が reloc 系も写すための口
 : dir-reloc-nn1 drop ; bind dir-reloc-nn1 dir-reloc
 : dir-clrreloc-nn2 drop ; bind dir-clrreloc-nn2 dir-clrreloc
 : dir-echo-nn3 drop ; bind dir-echo-nn3 dir-echo
 : dir-elf-nn4 2drop ; bind dir-elf-nn4 dir-elf
 : dir-pat-clear-extra-nn5 2drop ; bind dir-pat-clear-extra-nn5 dir-pat-clear-extra
+: dir-as-extra-nn6 2drop 2drop ; bind dir-as-extra-nn6 dir-as-extra
 
 2 lazy-om chk-cache                       \ 変数 + 欄 -> [世代][arr]
 : exec-check-inner ( row -- ) { r }
@@ -141,6 +143,53 @@ lazy-sb ms-b
     else mb-reset s"  error - .clrenum: variable should be a lower case name ('" mb+ mb+ s" ')." mb+ mb-get diag-e then
   else 2drop enumdefs om-clear then ;
 
+\ ---- .as ----
+\ `.as::<変数,...>::<変数>` の写し先の欄を、前後の空白を除いた綴りの並びに分ける
+\ (空の項目は除く)。axx.py の _as_names() と同じ。並びには 1 つ余分に積める
+: as-dests ( row -- l ) { r }
+  r 1 rf { a u }
+  a u 44 count-ch 2 + lst-new { l }
+  0 { st }
+  u 1+ 0 ?do
+    i u = a i + c@ 44 = or if
+      a st + i st - trim dup if l lst-add-str else 2drop then
+      i 1+ to st
+    then
+  loop
+  l ;
+\ 変数 s の .check / .enum / .reloc / (.unordered の .map の表) を d へ写す。s に無いものは d から外す
+: as-copy ( sa su da du -- ) { sa su da du }
+  sa su chk-get ?dup if arr-clone { c } da du c chk-set else da du chk-del2 then
+  sa su enumdefs om-find ?dup if
+    dup @ over cell+ @ rot 2 cells + @ { n ea eu }
+    da du enumdefs om-put { sl }  n sl !  ea sl cell+ !  eu sl 2 cells + !
+  else da du enumdefs om-del then
+  sa su vartabs om-find ?dup if
+    @ { t }  t da du vartabs om-put !
+  else da du vartabs om-del then
+  sa su da du dir-as-extra ;
+\ `.as::<変数,...>::<変数>` — 写し元の変数の設定を、その位置で写し先の変数へ写す。
+\ 後で写し元を変えても写し先は変わらない。axx.py の as_processing() と同じ
+: exec-as ( row -- ) { r }
+  r as-dests { l }
+  r 2 rf trim { sa su }
+  l lst-n 0= su 0= or if s"  error - .as: needs '.as::<variable,...>::<variable>'." diag-e exit then
+  sa su l lst-add-str
+  l lst-n { n }
+  n lst-new { vl }
+  n 0 ?do
+    l i lst-item item-str { ta tu }
+    ta tu dir-var if vl lst-add-str else
+      mb-reset s"  error - .as: variable should be a lower case name ('" mb+ ta tu mb+ s" ')." mb+ mb-get diag-e
+      unloop exit
+    then
+  loop
+  vl n 1- lst-item item-str { sva svu }
+  n 1- 0 ?do
+    vl i lst-item item-str { dva dvu }
+    dva dvu sva svu str=cs 0= if sva svu dva dvu as-copy then
+  loop ;
+
 \ ---- on / off 形式 ----
 : onoff-arg ( row -- -1|0|1 ) { r }                      \ 空/ON=1  OFF=0  その他=-1 (エラー済み)
   r 1 field-nonblank supper { a u }
@@ -198,5 +247,6 @@ lazy-sb ms-b
     19 of mode 0= if r dir-echo then endof
     20 of endof
     21 of mode 0= if r exec-epic then endof
+    22 of mode 0= if r exec-as then endof
     30 of r mode dir-elf endof
   endcase ;

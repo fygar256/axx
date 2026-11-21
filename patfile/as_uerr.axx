@@ -1,0 +1,27 @@
+/* ===================================================================
+/* as_uerr.axx -- the errors of `.as` in an .unordered pattern file
+/*                (manual 3.7.12)
+/*
+/*   axx as_uerr.axx as_err.s -b out.bin
+/* =================================================================== */
+
+.unordered
+
+.as::s::r
+.as::s::x               /* s is given two different right variables */
+.as::s::r               /* the same one again is no error */
+
+.check::t::A
+.as::t::r               /* t has a .check and an .as */
+
+.enum::e::A,B::A|B
+.as::e,f::r             /* e has an .enum and an .as */
+
+.as::a::b               /* a and b copy each other */
+.as::b,g::a
+
+.as::c::c               /* copying itself is nothing */
+
+.setsym::A::1
+.setsym::B::2
+NOP :: 0x00

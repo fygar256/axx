@@ -286,6 +286,17 @@ unordered.axx                       .unordered: directives that hold for the
                                     .map tables per variable, so the Z80 C is
                                     a register for one variable and carry for
                                     another (manual 3.19)
+as.axx                              .as: a variable's .check / .enum / .reloc
+                                    copied to other variables where the line
+                                    stands (manual 3.7.12)
+as_unord.axx                        .as in an .unordered file: copied after
+                                    every other directive, in dependency
+                                    order, with the per-variable .map table
+                                    (manual 3.7.12)
+as_err.axx                          the errors of .as (manual 3.7.12)
+as_uerr.axx                         the errors of .as in an .unordered file:
+                                    two definitions of one variable and
+                                    cycles (manual 3.7.12)
 
 -------------------------------------------------------------------------------
 patfile/: pattern files for the ELF output (-o)
@@ -645,6 +656,11 @@ exprmiss.s                          test assemble file for exprmiss.axx
 ministr.s                           test assemble file for ministr.axx
 endsub.s                            test assemble file for endsub.axx
 unordered.s                         test assemble file for unordered.axx
+as.s                                test assemble file for as.axx (-b, and -o
+                                    with -m 62 for the .reloc part)
+as_unord.s                          test assemble file for as_unord.axx
+as_err.s                            assembled with as_err.axx and as_uerr.axx:
+                                    the diagnostics of .as
 
 -------------------------------------------------------------------------------
 asmsrc/: test sources for the ELF output (-o)
