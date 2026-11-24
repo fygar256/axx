@@ -1,0 +1,5 @@
+SET 7
+GET
+POS
+POS
+STR 'a'

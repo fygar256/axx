@@ -1,0 +1,5 @@
+P !x :: .call show(.exp(x))
+.func show(s)
+.echo("[" + s + "]", .len(s))
+.return [0]
+.endfunc

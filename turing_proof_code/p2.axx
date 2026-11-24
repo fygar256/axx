@@ -1,0 +1,11 @@
+SET !v :: ;;(z:=v)
+GET :: z
+POS :: .call pos($$)
+STR !x :: .call show(.exp(x))
+.func pos(a)
+.return [a & 0xff]
+.endfunc
+.func show(s)
+.echo("[" + s + "]")
+.return [.len(s)]
+.endfunc

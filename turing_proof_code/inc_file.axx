@@ -1,0 +1,123 @@
+/* P_M for M = binary increment, reading the whole source file through $$
+/* each line "D v" (v = 0..2) appends one symbol; the last line "END" runs M
+D !v :: v<0;1,v>2;1 :: .call acc($$,v)
+END :: .call fin($$)
+
+.func acc(a,v)
+z=[]
+z[a*2+v]=0
+.return z
+.endfunc
+
+.func fin(a)
+ds=[]
+n=0
+.while(a>0)
+d=(a-1)%3+1
+ds[n]=d-1
+n=n+1
+a=(a-d)/3
+.endwhile
+inp=""
+j=n-1
+.while(j>=0)
+.if j<n-1 .then
+inp=inp+"+"
+.endif
+inp=inp+ds[j]
+j=j-1
+.endwhile
+.if n==0 .then
+inp="0"
+.endif
+r=.call utm("1+1+1+1+1+1+2+2+1+1+1+0+0+0+2+2+2+1+0+2+2+1+2+0+0+2+0+2+0+0",inp)
+r[0:0]=[0xff]
+.return r
+.endfunc
+
+.func nums(s)
+a=[]
+n=0
+v=0
+i=0
+.while(i<.len(s))
+c=s[i]
+.if c>=48 && c<=57 .then
+v=v*10+(c-48)
+.elif c==43 .then
+a[n]=v
+n=n+1
+v=0
+.else
+.raise 1
+.return a
+.endif
+i=i+1
+.endwhile
+a[n]=v
+.return a
+.endfunc
+
+.func utm(d,x)
+rules=.call nums(d)
+inp=.call nums(x)
+nr=.len(rules)/5
+rt=[]
+lt=[]
+.for i in range(.len(inp))
+rt[i]=inp[i]
+.next
+q=1
+h=0
+.while(q!=0)
+.if h>=0 .then
+c=rt[h]
+.else
+c=lt[-h-1]
+.endif
+f=-1
+k=0
+.while(k<nr)
+.if rules[5*k]==q && rules[5*k+1]==c .then
+f=k
+.break
+.endif
+k=k+1
+.endwhile
+.if f<0 .then
+.break
+.endif
+.if h>=0 .then
+rt[h]=rules[5*f+2]
+.else
+lt[-h-1]=rules[5*f+2]
+.endif
+.if rules[5*f+3]==0 .then
+h=h-1
+.else
+h=h+1
+.endif
+q=rules[5*f+4]
+.endwhile
+tape=[]
+n=0
+j=.len(lt)-1
+.while(j>=0)
+tape[n]=lt[j]
+n=n+1
+j=j-1
+.endwhile
+.for i in range(.len(rt))
+tape[n]=rt[i]
+n=n+1
+.next
+a=0
+.while(a<n && tape[a]==0)
+a=a+1
+.endwhile
+b=n
+.while(b>a && tape[b-1]==0)
+b=b-1
+.endwhile
+.return tape[a:b]
+.endfunc

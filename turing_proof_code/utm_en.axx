@@ -1,0 +1,98 @@
+/* utm.axx -- a universal Turing machine in the axx mini language
+/*
+/* One source line:  TM <rules>,<input>
+/*   <rules>  quintuples q+s+w+m+n joined with '+'
+/*            in state q reading symbol s: write w, move left if m=0 or right if m=1, go to state n
+/*            start state 1, halting state 0, symbol 0 is blank; it also halts when (q,s) has no rule
+/*   <input>  symbols joined with '+' (the head starts on the first symbol); 0 for a blank tape
+/* Output:    the tape on halting, from the leftmost to the rightmost non-blank cell (one word per cell)
+
+TM !d,!x :: .call utm(.exp(d),.exp(x))
+
+/* "12+0+7" -> [12, 0, 7]
+.func nums(s)
+a=[]
+n=0
+v=0
+i=0
+.while(i<.len(s))
+c=s[i]
+.if c>=48 && c<=57 .then
+v=v*10+(c-48)
+.elif c==43 .then
+a[n]=v
+n=n+1
+v=0
+.else
+.raise 1
+.return a
+.endif
+i=i+1
+.endwhile
+a[n]=v
+.return a
+.endfunc
+
+.func utm(d,x)
+rules=.call nums(d)
+inp=.call nums(x)
+nr=.len(rules)/5
+rt=[]
+lt=[]
+.for i in range(.len(inp))
+rt[i]=inp[i]
+.next
+q=1
+h=0
+.while(q!=0)
+.if h>=0 .then
+c=rt[h]
+.else
+c=lt[-h-1]
+.endif
+f=-1
+k=0
+.while(k<nr)
+.if rules[5*k]==q && rules[5*k+1]==c .then
+f=k
+.break
+.endif
+k=k+1
+.endwhile
+.if f<0 .then
+.break
+.endif
+.if h>=0 .then
+rt[h]=rules[5*f+2]
+.else
+lt[-h-1]=rules[5*f+2]
+.endif
+.if rules[5*f+3]==0 .then
+h=h-1
+.else
+h=h+1
+.endif
+q=rules[5*f+4]
+.endwhile
+tape=[]
+n=0
+j=.len(lt)-1
+.while(j>=0)
+tape[n]=lt[j]
+n=n+1
+j=j-1
+.endwhile
+.for i in range(.len(rt))
+tape[n]=rt[i]
+n=n+1
+.next
+a=0
+.while(a<n && tape[a]==0)
+a=a+1
+.endwhile
+b=n
+.while(b>a && tape[b-1]==0)
+b=b-1
+.endwhile
+.return tape[a:b]
+.endfunc
