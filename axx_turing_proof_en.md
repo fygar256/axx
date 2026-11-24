@@ -14,6 +14,8 @@ There are three proofs, and any one of them is enough.
 
 axx is also Turing complete when the pattern file is viewed as the program and the .s source file as its input (Theorems 3 and 4, section 5). Any Turing machine M can be written in a .axx file that outputs the result of applying M to the input written in the .s file. The input may sit on one line, or be spread over the whole file through the location counter `$$`.
 
+In short, axx is Turing complete as a system whose input is the source file (.s) and whose output is the file written with `-b`. Section 8 summarises how this works for each way of using the pattern file.
+
 Like every real computer, the axx implementation has runaway guards (4 million statements per `.call`, and others). This document therefore makes the limits explicit as a resource parameter Λ and considers the family axx_Λ. It shows that halting computations are reproduced exactly once Λ is large enough, and that non-halting computations end in an error with no output for every finite Λ. This is the standard meaning of Turing completeness.
 
 The constructions were run on both caxx (the C version) and paxx (the Python version). For 500 randomly generated Turing machines, the output matched a reference simulator byte for byte (section 7).
@@ -280,6 +282,25 @@ raw: wrote o.bin (4 bytes)
 ```
 
 For reference, a non-halting machine reached the limit in about 3.4 s on caxx and 59 s on paxx with the mini-language version, and in about 13 s on caxx and 8 min on paxx with the macro version. For a machine that keeps moving right so that the tape keeps growing, caxx took more than 5 minutes to reach the limit, so that measurement was stopped partway. This does not affect the conclusion of the proof.
+
+## 8. Summary: Turing completeness with the .s file as input and the `-b` file as output
+
+Result: axx is Turing complete even when the source file (.s) is viewed as the input and the file written with `-b` as the output. Depending on the role given to the pattern file, this takes one of the forms below, each covered by a theorem in this document.
+
+| Pattern file | What the .s file holds | `-b` output | Theorem |
+| --- | --- | --- | --- |
+| Fixed (`utm.axx`) | The machine's rule table and the input (one line `TM ⟨δ⟩,⟨x⟩`) | Exactly the result | Theorem 1 |
+| Built per machine (P_M) | Only the input (one line `IN ⟨w⟩`) | Exactly the result | Theorem 3 |
+| Built per machine (P_M) | Only the input (lines `D w₁` … `D w_n` and `END`) | Zero padding, the marker 0xFF, then the result | Theorem 4 |
+| Anything (e.g. `NOP :: 0x00`) | A machine written in macros, plus its input | Exactly the result | Theorem 2 |
+
+The first row means that, with the pattern file fixed, the transformation ".s → `-b` file" is a universal function: it can carry out any computation written in the .s file. The second and third rows are completeness with the pattern file as the program and the .s file as the data. In the fourth row, the .s file serves as both program and data.
+
+The conclusion rests on three conditions.
+
+- **Resource limits.** The implementation has limits such as 4 million statements per `.call`. Completeness is meant in this sense: a halting computation produces the correct output once the limits are large enough, and a non-halting computation ends in an error with no `-b` file written ((U1) and (U2) in section 2). This is the same sense in which real computers are called Turing complete.
+- **How the input is written.** An arbitrary string in the .s file cannot be used directly as input. It is encoded in a form the patterns can capture, such as an expression like `2+1+2+2`. This is like a Turing machine's input being a string over a fixed alphabet, and it does not affect completeness.
+- **Form of the output.** When the input is on one line (Theorems 1 and 3), the contents of the `-b` file match the result byte for byte. When the input is split over several lines (Theorem 4), information passes from line to line through the location counter `$$`, so zero padding and the marker 0xFF come before the result. The result is everything after the marker.
 
 ## Appendix A: utm.axx (universal Turing machine in the mini language)
 
