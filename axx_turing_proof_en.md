@@ -1,6 +1,6 @@
 # Proof that axx as a whole is Turing complete
 
-In practical terms, this proof is little more than an intellectual exercise; however, it serves as a theoretical guarantee that "axx"—which treats pattern files as executable code—is Turing-complete. To process an arbitrary string of symbols, one would need to apply "axx" twice.
+In practical terms, this proof is merely a playful exercise; however, it serves as a theoretical guarantee that "axx"—which treats pattern files as executable code—is Turing-complete. Note that "axx" on its own cannot process every arbitrary string of symbols (there are some it cannot handle), specifically those containing spaces, semicolons (;), or backslashes (\).
 
 2026-11-25
 
